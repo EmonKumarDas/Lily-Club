@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Lily CC</string>
+    <string name="title_activity_main">Lily CC</string>
+    <string name="package_name">com.lilycommunity.center</string>
+    <string name="custom_url_scheme">com.lilycommunity.center</string>
+</resources>
