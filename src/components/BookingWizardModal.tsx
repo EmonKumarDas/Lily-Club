@@ -17,6 +17,7 @@ import {
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from './Toast.js';
 import { Modal } from './Modal.js';
+import { ActionButton, useUnsavedChanges } from './ActionButton.js';
 import { SlotBadge, SlotIcon, type SlotType } from './SlotBadge.js';
 import { DualDatePicker } from './DualDatePicker.js';
 import {
@@ -28,7 +29,7 @@ import {
   getTodayDhakaYMD,
   isNightCrossingMidnight,
 } from '../lib/dateUtils.js';
-import { apiRequest } from '../lib/api.js';
+import { apiRequest, generateIdempotencyKey } from '../lib/api.js';
 import type { HallItem } from '../pages/HallsPage.js';
 import type { CustomerItem } from '../pages/CustomersPage.js';
 
@@ -123,6 +124,8 @@ export const BookingWizardModal: React.FC<BookingWizardModalProps> = ({
   // Submission & Idempotency
   const [idempotencyKey, setIdempotencyKey] = useState<string>('');
   const [saving, setSaving] = useState(false);
+
+  useUnsavedChanges(isOpen && dirty);
 
   const selectedHall = useMemo(
     () => halls.find((h) => h.id === hallId) || null,
@@ -507,6 +510,7 @@ export const BookingWizardModal: React.FC<BookingWizardModalProps> = ({
     if (!activeRoom || saving) return;
     setSaving(true);
     try {
+      const key = idempotencyKey || generateIdempotencyKey('booking');
       const payload = {
         customer_id: selectedCustomerId,
         hall_id: hallId,
@@ -525,7 +529,7 @@ export const BookingWizardModal: React.FC<BookingWizardModalProps> = ({
         status: bookingStatus,
         hold_hours: bookingStatus === 'TENTATIVE' ? Number(holdHours) : null,
         notes: notes.trim() || null,
-        idempotency_key: idempotencyKey,
+        idempotency_key: key,
       };
 
       if (isEditing && initialData?.bookingId) {
@@ -533,6 +537,7 @@ export const BookingWizardModal: React.FC<BookingWizardModalProps> = ({
           `/api/rooms/${activeRoom.id}/bookings/${initialData.bookingId}`,
           {
             method: 'PATCH',
+            idempotencyKey: key,
             body: JSON.stringify(payload),
           }
         );
@@ -543,6 +548,7 @@ export const BookingWizardModal: React.FC<BookingWizardModalProps> = ({
           `/api/rooms/${activeRoom.id}/bookings`,
           {
             method: 'POST',
+            idempotencyKey: key,
             body: JSON.stringify(payload),
           }
         );
@@ -1396,32 +1402,26 @@ export const BookingWizardModal: React.FC<BookingWizardModalProps> = ({
           )}
 
           {step < 5 ? (
-            <button
-              type="button"
+            <ActionButton
               onClick={handleNextStep}
-              className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs sm:text-sm font-bold shadow-md cursor-pointer"
+              icon={<ChevronRight className="w-4 h-4" />}
             >
-              <span>{t('nextStepBtn')}</span>
-              <ChevronRight className="w-4 h-4" />
-            </button>
+              {t('nextStepBtn')}
+            </ActionButton>
           ) : (
-            <button
-              type="button"
-              disabled={saving}
+            <ActionButton
+              loading={saving}
+              loadingLabel={t('saving')}
               onClick={handleConfirmSave}
-              className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs sm:text-sm font-bold shadow-md disabled:opacity-50 cursor-pointer"
+              icon={<Save className="w-4 h-4" />}
+              className="!bg-[#0E8A44] hover:!bg-[#0B7137] !border-[#0E8A44]"
             >
-              <Save className="w-4 h-4" />
-              <span>
-                {saving
-                  ? t('saving')
-                  : isEditing
-                  ? t('save')
-                  : language === 'bn'
-                  ? 'বুকিং নিশ্চিত ও সংরক্ষণ করুন'
-                  : 'Confirm & Save Booking'}
-              </span>
-            </button>
+              {isEditing
+                ? t('save')
+                : language === 'bn'
+                ? 'বুকিং নিশ্চিত ও সংরক্ষণ করুন'
+                : 'Confirm & Save Booking'}
+            </ActionButton>
           )}
         </div>
       </div>

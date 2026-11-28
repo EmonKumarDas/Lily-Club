@@ -15,11 +15,13 @@ import {
   StatusBar,
   Animated,
   PanResponder,
+  Share,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SplashScreen from 'expo-splash-screen';
 import * as ImagePicker from 'expo-image-picker';
+import * as Clipboard from 'expo-clipboard';
 import NetInfo from '@react-native-community/netinfo';
 import { Ionicons } from '@expo/vector-icons';
 import { LIGHT_COLORS, DARK_COLORS, ThemeMode } from './src/theme';
@@ -29,6 +31,8 @@ import {
   setServerUrl,
   setAuthToken,
   getAuthToken,
+  clearAllMobileCachedData,
+  generateIdempotencyKey,
   DEFAULT_SERVER_URL,
 } from './src/api';
 import {
@@ -88,6 +92,25 @@ export default function App() {
   const [activeRoom, setActiveRoom] = useState<any | null>(null);
   const [lastActiveRoom, setLastActiveRoom] = useState<any | null>(null);
   const [activeRole, setActiveRole] = useState<string>('VIEWER');
+
+  // Rebuilt Login Form State (tabs ONLY choose displayed form; role comes strictly from server)
+  const [loginRoleTab, setLoginRoleTab] = useState<'OWNER' | 'MANAGER' | 'STAFF'>('OWNER');
+  const [memberLoginMode, setMemberLoginMode] = useState<'PIN' | 'INVITE'>('PIN');
+  const [memberRoomId, setMemberRoomId] = useState('');
+  const [memberInviteCode, setMemberInviteCode] = useState('');
+  const [memberLoginName, setMemberLoginName] = useState('');
+  const [memberPin, setMemberPin] = useState('');
+  const [memberSubmitting, setMemberSubmitting] = useState(false);
+
+  // Owner-Only Invites, PIN Reset & Devices Modal State
+  const [teamAccessModalOpen, setTeamAccessModalOpen] = useState(false);
+  const [invitesList, setInvitesList] = useState<any[]>([]);
+  const [devicesList, setDevicesList] = useState<any[]>([]);
+  const [newInviteName, setNewInviteName] = useState('');
+  const [newInviteRole, setNewInviteRole] = useState<'MANAGER' | 'STAFF'>('STAFF');
+  const [generatedInviteCode, setGeneratedInviteCode] = useState<string | null>(null);
+  const [copiedInviteCode, setCopiedInviteCode] = useState(false);
+  const [creatingInvite, setCreatingInvite] = useState(false);
   const colors = activeRoom?.primary_color
     ? { ...baseColors, primary: activeRoom.primary_color }
     : baseColors;
@@ -157,25 +180,36 @@ export default function App() {
   const [editClubColor, setEditClubColor] = useState('#0E8A44');
   const [editClubLogoScale, setEditClubLogoScale] = useState<number>(1.0);
 
-  // Bookings Pagination (5 at a time + Load More)
+  // Bookings Pagination (5 at a time + Load More) & Calendar Date Filter
   const [bookingsVisibleCount, setBookingsVisibleCount] = useState<number>(5);
+  const [bookingsDateFrom, setBookingsDateFrom] = useState<string>('');
+  const [bookingsDateTo, setBookingsDateTo] = useState<string>('');
 
   // Calendar Direct Month & Year Picker Modals
   const [calMonthPickerOpen, setCalMonthPickerOpen] = useState(false);
   const [calYearPickerOpen, setCalYearPickerOpen] = useState(false);
 
-  // Full Cost Modal & Outstanding Dues Modal
+  // Full Cost Modal, Income Breakdown Modal, Revenue Breakdown Modal & Outstanding Dues Modal
   const [costModalOpen, setCostModalOpen] = useState(false);
+  const [incomeModalOpen, setIncomeModalOpen] = useState(false);
+  const [revenueModalOpen, setRevenueModalOpen] = useState(false);
   const [duesModalOpen, setDuesModalOpen] = useState(false);
   const [allDuesList, setAllDuesList] = useState<any[]>([]);
 
-  // Home Period Filter & Expenses Breakdown State
-  const [homePeriod, setHomePeriod] = useState<'DAY' | 'MONTH' | 'YEAR' | 'CUSTOM'>('MONTH');
-  const [customFrom, setCustomFrom] = useState('');
-  const [customTo, setCustomTo] = useState('');
-  const [datePickerTarget, setDatePickerTarget] = useState<'FROM' | 'TO' | null>(null);
+  // Home Calendar Period Filter, Payments & Expenses Breakdown State (Default = Running Month)
+  const nowInit = new Date();
+  const initYear = nowInit.getFullYear();
+  const initMonth = nowInit.getMonth() + 1;
+  const initLastDay = new Date(initYear, initMonth, 0).getDate();
+  const initYM = `${initYear}-${String(initMonth).padStart(2, '0')}`;
+  const [customFrom, setCustomFrom] = useState(`${initYM}-01`);
+  const [customTo, setCustomTo] = useState(`${initYM}-${String(initLastDay).padStart(2, '0')}`);
+  const [datePickerTarget, setDatePickerTarget] = useState<'FROM' | 'TO' | 'BOOKINGS_FROM' | 'BOOKINGS_TO' | null>(null);
   const [periodReport, setPeriodReport] = useState<any | null>(null);
   const [periodExpenses, setPeriodExpenses] = useState<any[]>([]);
+  const [periodPayments, setPeriodPayments] = useState<any[]>([]);
+  const [periodPaymentsTotal, setPeriodPaymentsTotal] = useState<number>(0);
+  const [periodBookings, setPeriodBookings] = useState<any[]>([]);
   const [addExpenseOpen, setAddExpenseOpen] = useState(false);
   const [expCategory, setExpCategory] = useState<'ELECTRICITY' | 'SALARY' | 'REPAIR' | 'CLEANING' | 'DECORATION_MATERIAL' | 'FOOD' | 'OTHER'>('ELECTRICITY');
   const [expAmount, setExpAmount] = useState('');
@@ -198,6 +232,9 @@ export default function App() {
   const [editProfileName, setEditProfileName] = useState('');
   const [editProfilePic, setEditProfilePic] = useState('');
   const [savingProfile, setSavingProfile] = useState(false);
+  const [showRoomCode, setShowRoomCode] = useState(false);
+  const [copiedRoomCode, setCopiedRoomCode] = useState(false);
+  const [regeneratingCode, setRegeneratingCode] = useState(false);
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
   const [newRoomName, setNewRoomName] = useState('Lily Community Center');
   const [newRoomAddress, setNewRoomAddress] = useState('দক্ষিণ মধ্য হালিশহর, বন্দর, চট্টগ্রাম');
@@ -335,39 +372,36 @@ export default function App() {
     }
   }, [activeRoom, loadRoomData]);
 
-  // Load Period-Specific Revenue & Expenses for Home Filter (Date / Month / Year / Custom)
+  // Load Period-Specific Revenue, Payments & Expenses for Home Calendar Filter (Default = Running Month)
   const loadPeriodFinancials = useCallback(async () => {
     if (!activeRoom || (activeRole !== 'OWNER' && activeRole !== 'MANAGER')) return;
     const todayYMD = dashboard?.todayYMD || new Date().toISOString().slice(0, 10);
-    const y = todayYMD.slice(0, 4);
+    const y = parseInt(todayYMD.slice(0, 4), 10);
+    const m = parseInt(todayYMD.slice(5, 7), 10);
+    const lastDay = new Date(y, m, 0).getDate();
     const ym = todayYMD.slice(0, 7);
 
-    let df = `${ym}-01`;
-    let dt = `${ym}-31`;
-    if (homePeriod === 'DAY') {
-      df = todayYMD;
-      dt = todayYMD;
-    } else if (homePeriod === 'YEAR') {
-      df = `${y}-01-01`;
-      dt = `${y}-12-31`;
-    } else if (homePeriod === 'CUSTOM' && /^\d{4}-\d{2}-\d{2}$/.test(customFrom) && /^\d{4}-\d{2}-\d{2}$/.test(customTo)) {
-      df = customFrom;
-      dt = customTo;
-    }
+    const df = /^\d{4}-\d{2}-\d{2}$/.test(customFrom) ? customFrom : `${ym}-01`;
+    const dt = /^\d{4}-\d{2}-\d{2}$/.test(customTo) ? customTo : `${ym}-${String(lastDay).padStart(2, '0')}`;
 
     try {
-      const [repRes, expRes] = await Promise.all([
+      const [repRes, expRes, payRes, bRes] = await Promise.all([
         apiFetch<{ report: any }>(`/api/rooms/${activeRoom.id}/reports?dateFrom=${df}&dateTo=${dt}`),
-        apiFetch<{ expenses: any[] }>(`/api/rooms/${activeRoom.id}/expenses?dateFrom=${df}&dateTo=${dt}&limit=50`),
+        apiFetch<{ expenses: any[] }>(`/api/rooms/${activeRoom.id}/expenses?dateFrom=${df}&dateTo=${dt}&limit=100`),
+        apiFetch<{ payments: any[]; netTotalAmount: number }>(`/api/rooms/${activeRoom.id}/payments?dateFrom=${df}&dateTo=${dt}&limit=100`),
+        apiFetch<{ bookings: any[] }>(`/api/rooms/${activeRoom.id}/bookings?dateFrom=${df}&dateTo=${dt}&limit=200`),
       ]);
       setPeriodReport(repRes.report);
       setPeriodExpenses(expRes.expenses || []);
+      setPeriodPayments(payRes.payments || []);
+      setPeriodPaymentsTotal(payRes.netTotalAmount ?? 0);
+      setPeriodBookings((bRes.bookings || []).filter((b) => b.status !== 'CANCELLED'));
     } catch { }
-  }, [activeRoom, activeRole, homePeriod, customFrom, customTo, dashboard?.todayYMD]);
+  }, [activeRoom, activeRole, customFrom, customTo, dashboard?.todayYMD]);
 
   useEffect(() => {
     if (activeRoom) loadPeriodFinancials();
-  }, [activeRoom, homePeriod, loadPeriodFinancials]);
+  }, [activeRoom, loadPeriodFinancials]);
 
   // Load Bookings for Swiped Calendar Month/Year
   useEffect(() => {
@@ -452,41 +486,153 @@ export default function App() {
     setRefreshing(false);
   };
 
-  const handleDevLogin = async (role: 'OWNER' | 'MANAGER' | 'STAFF' | 'VIEWER') => {
-    const devUsers = {
-      OWNER: { email: 'owner@lilycc.local', name: 'Al-Amin Hossain (Owner)' },
-      MANAGER: { email: 'manager@lilycc.local', name: 'Tanzina Begum (Manager)' },
-      STAFF: { email: 'staff@lilycc.local', name: 'Rakib Hasan (Staff)' },
-      VIEWER: { email: 'viewer@lilycc.local', name: 'Shamsul Alam (Viewer)' },
-    };
-    const chosen = devUsers[role];
+  const actionLockRef = useRef(false);
+  const handleGoogleLogin = async () => {
+    if (actionLockRef.current) return;
+    actionLockRef.current = true;
     try {
       setAuthLoading(true);
-      const res = await apiFetch<{ token: string }>('/api/auth/dev-login', {
-        method: 'POST',
-        body: JSON.stringify({
-          email: chosen.email,
-          name: chosen.name,
-          googleId: `dev-${role.toLowerCase()}-123`,
-        }),
-      });
-      if (res.token) {
-        await setAuthToken(res.token);
+      const res = await apiFetch<{ url: string }>('/api/auth/google/url');
+      if (res.url) {
+        await Linking.openURL(res.url);
       }
-      await loadSession();
     } catch (err: any) {
       Alert.alert(lang === 'bn' ? 'লগইন ব্যর্থ' : 'Login Failed', err.message);
+    } finally {
       setAuthLoading(false);
+      actionLockRef.current = false;
     }
   };
 
+  const handleMemberAuthSubmit = async () => {
+    if (actionLockRef.current || loginRoleTab === 'OWNER') return;
+    if (!memberRoomId.trim() || !memberLoginName.trim() || !memberPin.trim()) {
+      Alert.alert(
+        lang === 'bn' ? 'তথ্য অসম্পূর্ণ' : 'Missing Details',
+        lang === 'bn' ? 'রুম আইডি, লগইন নাম এবং ৬+ ডিজিটের পিন দিন।' : 'Enter Room ID, Login Name, and 6+ digit PIN.'
+      );
+      return;
+    }
+    if (memberLoginMode === 'INVITE' && !memberInviteCode.trim()) {
+      Alert.alert(
+        lang === 'bn' ? 'ইনভাইট কোড দিন' : 'Invite Code Required',
+        lang === 'bn' ? 'মালিকের দেওয়া এক-ব্যবহারযোগ্য ইনভাইট কোডটি লিখুন।' : 'Enter the single-use invite code issued by the Owner.'
+      );
+      return;
+    }
+    actionLockRef.current = true;
+    setMemberSubmitting(true);
+    try {
+      let deviceFp = await AsyncStorage.getItem('lily_device_fp');
+      if (!deviceFp) {
+        deviceFp = `mob-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        await AsyncStorage.setItem('lily_device_fp', deviceFp);
+      }
+      const endpoint = memberLoginMode === 'INVITE' ? '/api/auth/member/redeem-invite' : '/api/auth/member/login';
+      const payload =
+        memberLoginMode === 'INVITE'
+          ? {
+              roomJoinCode: memberRoomId.trim().toUpperCase(),
+              inviteCode: memberInviteCode.trim().toUpperCase(),
+              selectedRole: loginRoleTab,
+              loginName: memberLoginName.trim(),
+              pin: memberPin.trim(),
+              deviceFingerprint: deviceFp,
+              deviceName: 'LilyCC Mobile App',
+            }
+          : {
+              roomJoinCode: memberRoomId.trim().toUpperCase(),
+              selectedRole: loginRoleTab,
+              loginName: memberLoginName.trim(),
+              pin: memberPin.trim(),
+              deviceFingerprint: deviceFp,
+              deviceName: 'LilyCC Mobile App',
+            };
+      const res = await apiFetch<{ token: string }>(endpoint, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (res.token) {
+        await setAuthToken(res.token);
+        setMemberPin('');
+        setMemberInviteCode('');
+        await loadSession();
+      }
+    } catch (err: any) {
+      Alert.alert(lang === 'bn' ? 'লগইন ব্যর্থ' : 'Login Failed', err.message);
+    } finally {
+      setMemberSubmitting(false);
+      actionLockRef.current = false;
+    }
+  };
+
+  const openTeamAccessModal = async () => {
+    if (!activeRoom || activeRole !== 'OWNER') return;
+    setGeneratedInviteCode(null);
+    setTeamAccessModalOpen(true);
+    try {
+      const [invRes, devRes] = await Promise.all([
+        apiFetch<{ invites: any[] }>(`/api/rooms/${activeRoom.id}/invites`),
+        apiFetch<{ devices: any[] }>(`/api/rooms/${activeRoom.id}/devices`),
+      ]);
+      setInvitesList(invRes.invites || []);
+      setDevicesList(devRes.devices || []);
+    } catch { }
+  };
+
+  const handleCreateInvite = async () => {
+    if (!activeRoom || creatingInvite || !newInviteName.trim()) return;
+    setCreatingInvite(true);
+    try {
+      const idemKey = `inv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const res = await apiFetch<{ invite: any; inviteCode: string | null }>(`/api/rooms/${activeRoom.id}/invites`, {
+        method: 'POST',
+        headers: { 'X-Idempotency-Key': idemKey },
+        body: JSON.stringify({
+          memberName: newInviteName.trim(),
+          role: newInviteRole,
+          idempotency_key: idemKey,
+        }),
+      });
+      if (res.inviteCode) {
+        setGeneratedInviteCode(res.inviteCode);
+      }
+      setNewInviteName('');
+      const invRes = await apiFetch<{ invites: any[] }>(`/api/rooms/${activeRoom.id}/invites`);
+      setInvitesList(invRes.invites || []);
+    } catch (err: any) {
+      Alert.alert('Error', err.message);
+    } finally {
+      setCreatingInvite(false);
+    }
+  };
+
+  const clearRoomMemory = useCallback(() => {
+    setDashboard(null);
+    setBookings([]);
+    setHalls([]);
+    setCustomers([]);
+    setReport(null);
+    setExpenses([]);
+    setPeriodReport(null);
+    setPeriodExpenses([]);
+    setPeriodPayments([]);
+    setPeriodBookings([]);
+    setAllDuesList([]);
+    setCalBookings([]);
+  }, []);
+
   const openRoomSelector = () => {
     if (activeRoom) setLastActiveRoom(activeRoom);
+    clearRoomMemory();
     setActiveRoom(null);
   };
 
   const handleSwitchRoom = async (roomId: string) => {
+    if (actionLockRef.current) return;
+    actionLockRef.current = true;
     try {
+      clearRoomMemory();
       await apiFetch(`/api/rooms/switch`, {
         method: 'POST',
         body: JSON.stringify({ roomId }),
@@ -495,6 +641,8 @@ export default function App() {
       setActiveTab('home');
     } catch (err: any) {
       Alert.alert('Error', err.message);
+    } finally {
+      actionLockRef.current = false;
     }
   };
 
@@ -600,14 +748,20 @@ export default function App() {
   };
 
   const handleLogoutAll = async () => {
+    if (actionLockRef.current) return;
+    actionLockRef.current = true;
     try {
       await apiFetch('/api/auth/logout-all', { method: 'POST' });
     } catch {}
     await setAuthToken(null);
+    await clearAllMobileCachedData().catch(() => {});
+    clearRoomMemory();
+    setRooms([]);
+    setLastActiveRoom(null);
     setUser(null);
     setActiveRoom(null);
-    setDashboard(null);
     setProfileModalOpen(false);
+    actionLockRef.current = false;
   };
 
   const openClubSettings = () => {
@@ -695,13 +849,19 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    if (actionLockRef.current) return;
+    actionLockRef.current = true;
     try {
       await apiFetch('/api/auth/logout', { method: 'POST' });
     } catch { }
     await setAuthToken(null);
+    await clearAllMobileCachedData().catch(() => {});
+    clearRoomMemory();
+    setRooms([]);
+    setLastActiveRoom(null);
     setUser(null);
     setActiveRoom(null);
-    setDashboard(null);
+    actionLockRef.current = false;
   };
 
   // ==================== 1. ANIMATED SPLASH / FLASH SCREEN WITH OFFICIAL LOGO ====================
@@ -825,41 +985,168 @@ export default function App() {
                   : 'Internal Hall Bookings, Day/Night Slots & Cash Memo'}
               </Text>
 
-              {authLoading ? (
-                <ActivityIndicator size="large" color={colors.primary} style={{ marginVertical: 20 }} />
-              ) : (
-                <View style={styles.devLoginGrid}>
-                  <Text style={[styles.devHint, { color: colors.primary }]}>
-                    {lang === 'bn' ? 'কুইক সাইন-ইন (ডেভেলপমেন্ট)' : 'Quick Sign-In (Development)'}
-                  </Text>
-                  {(['OWNER', 'MANAGER', 'STAFF', 'VIEWER'] as const).map((r) => (
+              {/* Three Role Form Selector Tabs (ONLY choose which form is shown; role comes strictly from server) */}
+              <View style={{ flexDirection: 'row', gap: 6, marginTop: 14, width: '100%' }}>
+                {(
+                  [
+                    { key: 'OWNER', bn: 'মালিক', en: 'Owner' },
+                    { key: 'MANAGER', bn: 'ম্যানেজার', en: 'Manager' },
+                    { key: 'STAFF', bn: 'স্টাফ', en: 'Staff' },
+                  ] as const
+                ).map((tab) => {
+                  const active = loginRoleTab === tab.key;
+                  return (
                     <TouchableOpacity
-                      key={r}
-                      onPress={() => handleDevLogin(r)}
-                      style={[
-                        styles.roleLoginBtn,
-                        {
-                          backgroundColor: r === 'OWNER' ? colors.primary : colors.cardAlt,
-                          borderColor: r === 'OWNER' ? colors.primary : colors.border,
-                        },
-                      ]}
+                      key={tab.key}
+                      onPress={() => setLoginRoleTab(tab.key)}
+                      style={{
+                        flex: 1,
+                        paddingVertical: 9,
+                        borderRadius: 10,
+                        borderWidth: 1,
+                        alignItems: 'center',
+                        backgroundColor: active ? colors.primary : colors.bg,
+                        borderColor: active ? colors.primary : colors.border,
+                      }}
                     >
-                      <Ionicons
-                        name="person-circle-outline"
-                        size={20}
-                        color={r === 'OWNER' ? '#fff' : colors.primary}
-                      />
-                      <Text
-                        style={{
-                          color: r === 'OWNER' ? '#fff' : colors.text,
-                          fontWeight: '800',
-                          fontSize: 14,
-                        }}
-                      >
-                        {r}
+                      <Text style={{ color: active ? '#fff' : colors.text, fontWeight: '800', fontSize: 12 }}>
+                        {lang === 'bn' ? tab.bn : tab.en}
                       </Text>
                     </TouchableOpacity>
-                  ))}
+                  );
+                })}
+              </View>
+
+              {loginRoleTab === 'OWNER' ? (
+                <>
+                  <TouchableOpacity
+                    onPress={handleGoogleLogin}
+                    disabled={authLoading}
+                    style={[
+                      styles.primaryFullBtn,
+                      {
+                        backgroundColor: colors.primary,
+                        marginTop: 16,
+                        opacity: authLoading ? 0.7 : 1,
+                      },
+                    ]}
+                  >
+                    {authLoading ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Ionicons name="logo-google" size={18} color="#fff" />
+                    )}
+                    <Text style={styles.primaryFullBtnText}>
+                      {lang === 'bn' ? 'Google দিয়ে মালিক লগইন' : 'Owner Sign in with Google'}
+                    </Text>
+                  </TouchableOpacity>
+                  <Text style={{ fontSize: 11, color: colors.textMuted, textAlign: 'center', marginTop: 10 }}>
+                    {lang === 'bn'
+                      ? 'মালিক শুধুমাত্র যাচাইকৃত Google অ্যাকাউন্ট দিয়ে লগইন ও রুম তৈরি করতে পারবেন।'
+                      : 'Owners sign in with a verified Google account only.'}
+                  </Text>
+                </>
+              ) : (
+                <View style={{ width: '100%', gap: 9, marginTop: 14 }}>
+                  <View style={{ flexDirection: 'row', gap: 6 }}>
+                    <TouchableOpacity
+                      onPress={() => setMemberLoginMode('PIN')}
+                      style={{
+                        flex: 1,
+                        paddingVertical: 7,
+                        borderRadius: 8,
+                        borderWidth: 1,
+                        alignItems: 'center',
+                        backgroundColor: memberLoginMode === 'PIN' ? colors.primarySoft : colors.bg,
+                        borderColor: memberLoginMode === 'PIN' ? colors.primary : colors.border,
+                      }}
+                    >
+                      <Text style={{ fontSize: 11, fontWeight: '800', color: memberLoginMode === 'PIN' ? colors.primary : colors.textMuted }}>
+                        {lang === 'bn' ? 'নিয়মিত (PIN)' : 'Returning (PIN)'}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => setMemberLoginMode('INVITE')}
+                      style={{
+                        flex: 1,
+                        paddingVertical: 7,
+                        borderRadius: 8,
+                        borderWidth: 1,
+                        alignItems: 'center',
+                        backgroundColor: memberLoginMode === 'INVITE' ? colors.primarySoft : colors.bg,
+                        borderColor: memberLoginMode === 'INVITE' ? colors.primary : colors.border,
+                      }}
+                    >
+                      <Text style={{ fontSize: 11, fontWeight: '800', color: memberLoginMode === 'INVITE' ? colors.primary : colors.textMuted }}>
+                        {lang === 'bn' ? 'প্রথমবার (ইনভাইট কোড)' : 'First Time (Invite)'}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  <TextInput
+                    value={memberRoomId}
+                    onChangeText={setMemberRoomId}
+                    autoCapitalize="characters"
+                    placeholder={lang === 'bn' ? 'রুম আইডি (Room ID)' : 'Room ID'}
+                    placeholderTextColor={colors.textMuted}
+                    style={[styles.inputBox, { borderColor: colors.border, color: colors.text }]}
+                  />
+                  {memberLoginMode === 'INVITE' && (
+                    <TextInput
+                      value={memberInviteCode}
+                      onChangeText={setMemberInviteCode}
+                      autoCapitalize="characters"
+                      placeholder={lang === 'bn' ? 'মালিকের দেওয়া ইনভাইট কোড (১২ অক্ষর)' : 'Owner-Issued Invite Code'}
+                      placeholderTextColor={colors.textMuted}
+                      style={[styles.inputBox, { borderColor: colors.border, color: colors.text }]}
+                    />
+                  )}
+                  <TextInput
+                    value={memberLoginName}
+                    onChangeText={setMemberLoginName}
+                    autoCapitalize="none"
+                    placeholder={lang === 'bn' ? 'লগইন নাম (Login Name)' : 'Login Name'}
+                    placeholderTextColor={colors.textMuted}
+                    style={[styles.inputBox, { borderColor: colors.border, color: colors.text }]}
+                  />
+                  <TextInput
+                    value={memberPin}
+                    onChangeText={setMemberPin}
+                    keyboardType="number-pad"
+                    secureTextEntry
+                    maxLength={12}
+                    placeholder={
+                      memberLoginMode === 'INVITE'
+                        ? lang === 'bn' ? 'নতুন ৬+ ডিজিটের পিন তৈরি করুন' : 'Create New 6+ Digit PIN'
+                        : lang === 'bn' ? 'আপনার ৬+ ডিজিটের পিন' : 'Your 6+ Digit PIN'
+                    }
+                    placeholderTextColor={colors.textMuted}
+                    style={[styles.inputBox, { borderColor: colors.border, color: colors.text }]}
+                  />
+
+                  <TouchableOpacity
+                    onPress={handleMemberAuthSubmit}
+                    disabled={memberSubmitting}
+                    style={[
+                      styles.primaryFullBtn,
+                      {
+                        backgroundColor: colors.primary,
+                        marginTop: 4,
+                        opacity: memberSubmitting ? 0.7 : 1,
+                      },
+                    ]}
+                  >
+                    {memberSubmitting ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Ionicons name="lock-closed" size={16} color="#fff" />
+                    )}
+                    <Text style={styles.primaryFullBtnText}>
+                      {memberLoginMode === 'INVITE'
+                        ? lang === 'bn' ? 'ইনভাইট যাচাই ও পিন সেট করুন' : 'Verify Invite & Set PIN'
+                        : lang === 'bn' ? 'পিন দিয়ে লগইন করুন' : 'Sign In with PIN'}
+                    </Text>
+                  </TouchableOpacity>
                 </View>
               )}
             </View>
@@ -869,7 +1156,7 @@ export default function App() {
         <DatePickerModal
           visible={datePickerTarget !== null}
           title={
-            datePickerTarget === 'FROM'
+            datePickerTarget === 'FROM' || datePickerTarget === 'BOOKINGS_FROM'
               ? lang === 'bn'
                 ? 'শুরুর তারিখ নির্বাচন করুন'
                 : 'Select From Date'
@@ -877,7 +1164,15 @@ export default function App() {
               ? 'শেষ তারিখ নির্বাচন করুন'
               : 'Select To Date'
           }
-          valueYMD={datePickerTarget === 'FROM' ? customFrom : customTo}
+          valueYMD={
+            datePickerTarget === 'FROM'
+              ? customFrom
+              : datePickerTarget === 'TO'
+              ? customTo
+              : datePickerTarget === 'BOOKINGS_FROM'
+              ? bookingsDateFrom
+              : bookingsDateTo
+          }
           lang={lang}
           colors={colors}
           onClose={() => setDatePickerTarget(null)}
@@ -885,9 +1180,17 @@ export default function App() {
             if (datePickerTarget === 'FROM') {
               setCustomFrom(ymd);
               if (customTo && ymd > customTo) setCustomTo(ymd);
-            } else {
+            } else if (datePickerTarget === 'TO') {
               setCustomTo(ymd);
               if (customFrom && ymd < customFrom) setCustomFrom(ymd);
+            } else if (datePickerTarget === 'BOOKINGS_FROM') {
+              setBookingsDateFrom(ymd);
+              if (bookingsDateTo && ymd > bookingsDateTo) setBookingsDateTo(ymd);
+              setBookingsVisibleCount(5);
+            } else if (datePickerTarget === 'BOOKINGS_TO') {
+              setBookingsDateTo(ymd);
+              if (bookingsDateFrom && ymd < bookingsDateFrom) setBookingsDateFrom(ymd);
+              setBookingsVisibleCount(5);
             }
           }}
         />
@@ -933,14 +1236,15 @@ export default function App() {
             {rooms.map((r) => (
               <TouchableOpacity
                 key={r.id}
+                disabled={r.member_status && r.member_status !== 'ACTIVE'}
                 onPress={() => handleSwitchRoom(r.id)}
-                style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}
+                style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border, opacity: r.member_status && r.member_status !== 'ACTIVE' ? 0.7 : 1 }]}
               >
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                   <View style={{ flex: 1 }}>
                     <Text style={{ fontSize: 16, fontWeight: '800', color: colors.text }}>{r.name}</Text>
                     <Text style={{ fontSize: 12, color: colors.textMuted, marginTop: 2 }}>
-                      ID: {r.join_code} • {r.role}
+                      {r.role} • {r.member_status || 'ACTIVE'}
                     </Text>
                   </View>
                   <Ionicons name="chevron-forward" size={20} color={colors.primary} />
@@ -1025,6 +1329,8 @@ export default function App() {
 
   const filteredBookings = bookings.filter((b) => {
     if (bookingStatusFilter && b.status !== bookingStatusFilter) return false;
+    if (bookingsDateFrom && b.event_date < bookingsDateFrom) return false;
+    if (bookingsDateTo && b.event_date > bookingsDateTo) return false;
     if (bookingSearch.trim()) {
       const q = bookingSearch.toLowerCase();
       return (
@@ -1075,7 +1381,7 @@ export default function App() {
                   {activeRoom.name}
                 </Text>
                 <Text style={{ fontSize: 10, fontWeight: '700', color: colors.primary }} numberOfLines={1}>
-                  {activeRole} • ID: {activeRoom.join_code}
+                  {activeRole}
                 </Text>
               </View>
             </TouchableOpacity>
@@ -1174,34 +1480,45 @@ export default function App() {
                 />
               </View>
 
-              {/* Quick Actions */}
-              <View style={styles.quickRow}>
-                {canCreate && (
+              {/* Quick Actions: New Booking + Cost directly below (same width) */}
+              {canCreate && (
+                <View style={{ gap: 8, width: '100%' }}>
                   <TouchableOpacity
                     onPress={() => {
                       setNewBookingPrefill({});
                       setNewBookingOpen(true);
                     }}
-                    style={[styles.qaBtn, { backgroundColor: colors.primarySoft, borderColor: colors.primary }]}
+                    style={[styles.primaryFullBtn, { backgroundColor: colors.primary, width: '100%' }]}
                   >
-                    <Ionicons name="add-circle" size={18} color={colors.primary} />
-                    <Text style={{ color: colors.primary, fontWeight: '800', fontSize: 12 }}>
+                    <Ionicons name="add-circle" size={18} color="#fff" />
+                    <Text style={styles.primaryFullBtnText}>
                       {lang === 'bn' ? 'নতুন বুকিং' : 'New Booking'}
                     </Text>
                   </TouchableOpacity>
-                )}
-                {canCreate && (
-                  <TouchableOpacity
-                    onPress={() => setAddCustOpen(true)}
-                    style={[styles.qaBtn, { backgroundColor: colors.goldSoft, borderColor: colors.gold }]}
-                  >
-                    <Ionicons name="person-add" size={18} color={colors.gold} />
-                    <Text style={{ color: colors.gold, fontWeight: '800', fontSize: 12 }}>
-                      {lang === 'bn' ? 'নতুন গ্রাহক' : 'Add Customer'}
-                    </Text>
-                  </TouchableOpacity>
-                )}
-              </View>
+
+                  {(activeRole === 'OWNER' ||
+                    activeRole === 'MANAGER' ||
+                    (activeRole === 'STAFF' && activeRoom?.allow_staff_costs === 1)) && (
+                    <TouchableOpacity
+                      onPress={() => setAddExpenseOpen(true)}
+                      style={[
+                        styles.primaryFullBtn,
+                        {
+                          backgroundColor: colors.card,
+                          borderWidth: 1.5,
+                          borderColor: colors.primary,
+                          width: '100%',
+                        },
+                      ]}
+                    >
+                      <Ionicons name="wallet-outline" size={18} color={colors.primary} />
+                      <Text style={[styles.primaryFullBtnText, { color: colors.primary }]}>
+                        {lang === 'bn' ? 'খরচ' : 'Cost'}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              )}
 
               {/* Demo Prompt if empty */}
               {halls.length === 0 && canSeeMoney && (
@@ -1223,14 +1540,31 @@ export default function App() {
                     value={String(dashboard.summaryCards.todaysEventsCount)}
                     color={colors.primary}
                     colors={colors}
-                    onPress={() => setActiveTab('bookings')}
+                    onPress={() => {
+                      const today = dashboard.todayYMD || new Date().toISOString().slice(0, 10);
+                      setBookingsDateFrom(today);
+                      setBookingsDateTo(today);
+                      setBookingStatusFilter('');
+                      setBookingsVisibleCount(5);
+                      setActiveTab('bookings');
+                    }}
                   />
                   <SummaryCard
                     title={lang === 'bn' ? 'আগামী ৭ দিন' : 'Next 7 Days'}
                     value={String(dashboard.summaryCards.upcomingWeekCount)}
                     color={colors.gold}
                     colors={colors}
-                    onPress={() => setActiveTab('bookings')}
+                    onPress={() => {
+                      const today = dashboard.todayYMD || new Date().toISOString().slice(0, 10);
+                      const [ty, tm, td] = today.split('-').map(Number);
+                      const d7 = new Date(Date.UTC(ty, tm - 1, td + 7));
+                      const plus7 = `${d7.getUTCFullYear()}-${String(d7.getUTCMonth() + 1).padStart(2, '0')}-${String(d7.getUTCDate()).padStart(2, '0')}`;
+                      setBookingsDateFrom(today);
+                      setBookingsDateTo(plus7);
+                      setBookingStatusFilter('');
+                      setBookingsVisibleCount(5);
+                      setActiveTab('bookings');
+                    }}
                   />
                   <SummaryCard
                     title={lang === 'bn' ? 'অস্থায়ী বুকিং' : 'Tentative Holds'}
@@ -1238,7 +1572,10 @@ export default function App() {
                     color={colors.amber}
                     colors={colors}
                     onPress={() => {
+                      setBookingsDateFrom('');
+                      setBookingsDateTo('');
                       setBookingStatusFilter('TENTATIVE');
+                      setBookingsVisibleCount(5);
                       setActiveTab('bookings');
                     }}
                   />
@@ -1251,86 +1588,81 @@ export default function App() {
                   />
                   {!dashboard.hideMoney && (
                     <>
-                      {/* Date / Month / Year / Custom Date Range Selector */}
-                      <View style={{ width: '100%', gap: 8, marginTop: 4 }}>
-                        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
-                          {(
-                            [
-                              { key: 'DAY', bn: 'আজ (Day)', en: 'Today' },
-                              { key: 'MONTH', bn: 'এই মাস (Month)', en: 'This Month' },
-                              { key: 'YEAR', bn: 'এই বছর (Year)', en: 'This Year' },
-                              { key: 'CUSTOM', bn: 'তারিখ থেকে তারিখ', en: 'Custom Range' },
-                            ] as const
-                          ).map((p) => {
-                            const active = homePeriod === p.key;
-                            return (
-                              <TouchableOpacity
-                                key={p.key}
-                                onPress={() => setHomePeriod(p.key)}
-                                style={[
-                                  styles.filterChip,
-                                  {
-                                    backgroundColor: active ? colors.primary : colors.card,
-                                    borderColor: active ? colors.primary : colors.border,
-                                  },
-                                ]}
-                              >
-                                <Text style={{ color: active ? '#fff' : colors.text, fontSize: 11, fontWeight: '800' }}>
-                                  {lang === 'bn' ? p.bn : p.en}
-                                </Text>
-                              </TouchableOpacity>
-                            );
-                          })}
-                        </ScrollView>
-                        {homePeriod === 'CUSTOM' && (
-                          <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
-                            <TouchableOpacity
-                              onPress={() => setDatePickerTarget('FROM')}
-                              style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
-                            >
-                              <View style={{ flex: 1 }}>
-                                <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
-                                  {lang === 'bn' ? 'শুরুর তারিখ' : 'From Date'}
-                                </Text>
-                                <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
-                                  {customFrom
-                                    ? (() => {
-                                        const [y, m, d] = customFrom.split('-').map(Number);
-                                        return lang === 'bn'
-                                          ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
-                                          : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
-                                      })()
-                                    : 'Select'}
-                                </Text>
-                              </View>
-                              <Ionicons name="calendar-outline" size={16} color={colors.primary} />
-                            </TouchableOpacity>
+                      {/* Calendar Date Range Selector (Default = Running Month) */}
+                      <View style={{ width: '100%', gap: 6, marginTop: 4 }}>
+                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <Text style={{ fontSize: 11.5, fontWeight: '800', color: colors.textMuted }}>
+                            📅 {lang === 'bn' ? 'ক্যালেন্ডার থেকে তারিখ নির্বাচন' : 'Select Date Range (Calendar)'}
+                          </Text>
+                          <TouchableOpacity
+                            onPress={() => {
+                              const todayYMD = dashboard?.todayYMD || new Date().toISOString().slice(0, 10);
+                              const y = parseInt(todayYMD.slice(0, 4), 10);
+                              const m = parseInt(todayYMD.slice(5, 7), 10);
+                              const lastDay = new Date(y, m, 0).getDate();
+                              const ym = todayYMD.slice(0, 7);
+                              setCustomFrom(`${ym}-01`);
+                              setCustomTo(`${ym}-${String(lastDay).padStart(2, '0')}`);
+                            }}
+                            style={{
+                              paddingHorizontal: 8,
+                              paddingVertical: 3,
+                              borderRadius: 12,
+                              backgroundColor: colors.primarySoft,
+                            }}
+                          >
+                            <Text style={{ fontSize: 10.5, fontWeight: '800', color: colors.primary }}>
+                              {lang === 'bn' ? 'চলতি মাস' : 'Current Month'}
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
+                        <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
+                          <TouchableOpacity
+                            onPress={() => setDatePickerTarget('FROM')}
+                            style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
+                          >
+                            <View style={{ flex: 1 }}>
+                              <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
+                                {lang === 'bn' ? 'শুরুর তারিখ' : 'From Date'}
+                              </Text>
+                              <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                                {customFrom
+                                  ? (() => {
+                                      const [y, m, d] = customFrom.split('-').map(Number);
+                                      return lang === 'bn'
+                                        ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                                        : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                                    })()
+                                  : 'Select'}
+                              </Text>
+                            </View>
+                            <Ionicons name="calendar-outline" size={16} color={colors.primary} />
+                          </TouchableOpacity>
 
-                            <Text style={{ color: colors.textMuted, fontWeight: '800' }}>→</Text>
+                          <Text style={{ color: colors.textMuted, fontWeight: '800' }}>→</Text>
 
-                            <TouchableOpacity
-                              onPress={() => setDatePickerTarget('TO')}
-                              style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
-                            >
-                              <View style={{ flex: 1 }}>
-                                <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
-                                  {lang === 'bn' ? 'শেষ তারিখ' : 'To Date'}
-                                </Text>
-                                <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
-                                  {customTo
-                                    ? (() => {
-                                        const [y, m, d] = customTo.split('-').map(Number);
-                                        return lang === 'bn'
-                                          ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
-                                          : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
-                                      })()
-                                    : 'Select'}
-                                </Text>
-                              </View>
-                              <Ionicons name="calendar-outline" size={16} color={colors.primary} />
-                            </TouchableOpacity>
-                          </View>
-                        )}
+                          <TouchableOpacity
+                            onPress={() => setDatePickerTarget('TO')}
+                            style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
+                          >
+                            <View style={{ flex: 1 }}>
+                              <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
+                                {lang === 'bn' ? 'শেষ তারিখ' : 'To Date'}
+                              </Text>
+                              <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                                {customTo
+                                  ? (() => {
+                                      const [y, m, d] = customTo.split('-').map(Number);
+                                      return lang === 'bn'
+                                        ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                                        : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                                    })()
+                                  : 'Select'}
+                              </Text>
+                            </View>
+                            <Ionicons name="calendar-outline" size={16} color={colors.primary} />
+                          </TouchableOpacity>
+                        </View>
                       </View>
 
                       <SummaryCard
@@ -1338,21 +1670,14 @@ export default function App() {
                         value={formatCurrency(periodReport?.collected ?? report?.collected ?? 0, lang)}
                         color={colors.primary}
                         colors={colors}
-                        onPress={() => navigateTab('more')}
+                        onPress={() => setIncomeModalOpen(true)}
                       />
                       <SummaryCard
                         title={lang === 'bn' ? 'মোট রাজস্ব' : 'Revenue'}
                         value={formatCurrency(periodReport?.revenue ?? dashboard.summaryCards.thisMonthRevenue ?? 0, lang)}
                         color={colors.gold}
                         colors={colors}
-                        onPress={() => navigateTab('more')}
-                      />
-                      <SummaryCard
-                        title={lang === 'bn' ? 'খরচ (Cost)' : 'Cost (Expenses)'}
-                        value={formatCurrency(periodReport?.expenses ?? report?.expenses ?? 0, lang)}
-                        color="#DC2626"
-                        colors={colors}
-                        onPress={() => setCostModalOpen(true)}
+                        onPress={() => setRevenueModalOpen(true)}
                       />
                       <SummaryCard
                         title={lang === 'bn' ? 'মোট বকেয়া (Dues)' : 'Total Dues'}
@@ -1361,173 +1686,11 @@ export default function App() {
                         colors={colors}
                         onPress={() => setDuesModalOpen(true)}
                       />
-
-                      {/* Expense Breakdown Card (Electricity Bill, Salary, Repair, etc.) */}
-                      <View style={[styles.card, { width: '100%', backgroundColor: colors.card, borderColor: colors.border, gap: 6 }]}>
-                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                          <Text style={{ fontWeight: '800', fontSize: 13, color: colors.text }}>
-                            💸 {lang === 'bn' ? 'খরচের খাতসমূহ (বিদ্যুৎ বিল, বেতন ইত্যাদি)' : 'Expenses Breakdown'}
-                          </Text>
-                          <TouchableOpacity
-                            onPress={() => setAddExpenseOpen(true)}
-                            style={[styles.retryPill, { backgroundColor: colors.primary }]}
-                          >
-                            <Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>
-                              + {lang === 'bn' ? 'খরচ যোগ' : 'Add'}
-                            </Text>
-                          </TouchableOpacity>
-                        </View>
-                        {periodExpenses.length === 0 ? (
-                          <Text style={{ fontSize: 12, color: colors.textMuted }}>
-                            {lang === 'bn' ? 'এই সময়ে কোনো খরচ রেকর্ড নেই।' : 'No expenses recorded for this period.'}
-                          </Text>
-                        ) : (
-                          periodExpenses.slice(0, 6).map((ex) => (
-                            <View key={ex.id} style={{ flexDirection: 'row', justifyContent: 'space-between', borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 5 }}>
-                              <View style={{ flex: 1 }}>
-                                <Text style={{ fontSize: 12, fontWeight: '700', color: colors.text }}>
-                                  {ex.category === 'ELECTRICITY' ? '⚡ বিদ্যুৎ বিল (Electricity)' : ex.category}
-                                </Text>
-                                <Text style={{ fontSize: 10.5, color: colors.textMuted }}>
-                                  {formatDualDateFromYMD(ex.expense_date, lang)} {ex.note ? `• ${ex.note}` : ''}
-                                </Text>
-                              </View>
-                              <Text style={{ fontSize: 12.5, fontWeight: '800', color: '#DC2626' }}>
-                                {formatCurrency(ex.amount, lang)}
-                              </Text>
-                            </View>
-                          ))
-                        )}
-                      </View>
                     </>
                   )}
                 </View>
               )}
 
-              {/* Today at a Glance */}
-              <Text style={[styles.secHeading, { color: colors.text }]}>
-                {lang === 'bn' ? 'আজকের হল অবস্থা (দিন ও রাত)' : 'Today at a Glance'}
-              </Text>
-              {(dashboard?.todayAtAGlance || []).map((h: any) => (
-                <View key={h.hall_id} style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
-                  <Text style={{ fontWeight: '800', fontSize: 15, color: colors.text, marginBottom: 8 }}>
-                    {h.hall_name}
-                  </Text>
-                  <View style={styles.twoCol}>
-                    <TouchableOpacity
-                      onPress={() =>
-                        h.day_holder
-                          ? setDetailBookingId(h.day_holder.booking_id)
-                          : canCreate &&
-                          (setNewBookingPrefill({
-                            date: dashboard.todayYMD,
-                            hallId: h.hall_id,
-                            slot: 'DAY',
-                          }),
-                            setNewBookingOpen(true))
-                      }
-                      style={[
-                        styles.slotPill,
-                        {
-                          backgroundColor:
-                            h.day_status === 'FREE'
-                              ? colors.primarySoft
-                              : h.day_status === 'TENTATIVE'
-                                ? colors.amberSoft
-                                : colors.crimsonSoft,
-                        },
-                      ]}
-                    >
-                      <Text style={{ fontWeight: '800', fontSize: 12, color: colors.text }}>
-                        ☀️ {lang === 'bn' ? 'দিন' : 'Day'}: {h.day_status}
-                      </Text>
-                      {h.day_holder && (
-                        <Text style={{ fontSize: 11, color: colors.textMuted }} numberOfLines={1}>
-                          {h.day_holder.customer_name}
-                        </Text>
-                      )}
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      onPress={() =>
-                        h.night_holder
-                          ? setDetailBookingId(h.night_holder.booking_id)
-                          : canCreate &&
-                          (setNewBookingPrefill({
-                            date: dashboard.todayYMD,
-                            hallId: h.hall_id,
-                            slot: 'NIGHT',
-                          }),
-                            setNewBookingOpen(true))
-                      }
-                      style={[
-                        styles.slotPill,
-                        {
-                          backgroundColor:
-                            h.night_status === 'FREE'
-                              ? colors.primarySoft
-                              : h.night_status === 'TENTATIVE'
-                                ? colors.amberSoft
-                                : colors.crimsonSoft,
-                        },
-                      ]}
-                    >
-                      <Text style={{ fontWeight: '800', fontSize: 12, color: colors.text }}>
-                        🌙 {lang === 'bn' ? 'রাত' : 'Night'}: {h.night_status}
-                      </Text>
-                      {h.night_holder && (
-                        <Text style={{ fontSize: 11, color: colors.textMuted }} numberOfLines={1}>
-                          {h.night_holder.customer_name}
-                        </Text>
-                      )}
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              ))}
-
-              {/* Upcoming Next 7 Days */}
-              <Text style={[styles.secHeading, { color: colors.text }]}>
-                {lang === 'bn' ? 'আগামী ৭ দিনের বুকিং' : 'Upcoming (Next 7 Days)'}
-              </Text>
-              {(dashboard?.upcomingNext7Days || []).length === 0 ? (
-                <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
-                  <Text style={{ color: colors.textMuted, textAlign: 'center' }}>
-                    {lang === 'bn' ? 'আগামী ৭ দিনে কোনো বুকিং নেই' : 'No upcoming events in the next 7 days'}
-                  </Text>
-                </View>
-              ) : (
-                (dashboard?.upcomingNext7Days || []).map((b: any) => (
-                  <TouchableOpacity
-                    key={b.id}
-                    onPress={() => setDetailBookingId(b.id)}
-                    style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}
-                  >
-                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <Text style={{ fontWeight: '800', color: colors.text, fontSize: 14, flex: 1 }}>
-                        {b.customer_name}
-                      </Text>
-                      <View
-                        style={[
-                          styles.statusTag,
-                          { backgroundColor: b.status === 'CONFIRMED' ? colors.primarySoft : colors.amberSoft },
-                        ]}
-                      >
-                        <Text
-                          style={{
-                            fontSize: 10,
-                            fontWeight: '800',
-                            color: b.status === 'CONFIRMED' ? colors.primary : colors.amber,
-                          }}
-                        >
-                          {b.slot} • {b.status}
-                        </Text>
-                      </View>
-                    </View>
-                    <Text style={{ fontSize: 12, color: colors.textMuted, marginTop: 4 }}>
-                      {b.hall_name} • {formatDualDateFromYMD(b.event_date, lang)}
-                    </Text>
-                  </TouchableOpacity>
-                ))
-              )}
             </View>
           )}
 
@@ -1775,6 +1938,74 @@ export default function App() {
                 })}
               </ScrollView>
 
+              {/* Bookings Calendar Date Filter */}
+              <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
+                <TouchableOpacity
+                  onPress={() => setDatePickerTarget('BOOKINGS_FROM')}
+                  style={[styles.searchBox, { backgroundColor: colors.card, borderColor: bookingsDateFrom ? colors.primary : colors.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 9, fontWeight: '700', color: colors.textMuted }}>
+                      {lang === 'bn' ? 'তারিখ হতে' : 'From Date'}
+                    </Text>
+                    <Text style={{ fontSize: 11.5, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                      {bookingsDateFrom
+                        ? (() => {
+                            const [y, m, d] = bookingsDateFrom.split('-').map(Number);
+                            return lang === 'bn'
+                              ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                              : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                          })()
+                        : lang === 'bn'
+                        ? 'সব তারিখ'
+                        : 'All Dates'}
+                    </Text>
+                  </View>
+                  <Ionicons name="calendar-outline" size={15} color={colors.primary} />
+                </TouchableOpacity>
+
+                <Text style={{ color: colors.textMuted, fontWeight: '800' }}>→</Text>
+
+                <TouchableOpacity
+                  onPress={() => setDatePickerTarget('BOOKINGS_TO')}
+                  style={[styles.searchBox, { backgroundColor: colors.card, borderColor: bookingsDateTo ? colors.primary : colors.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 9, fontWeight: '700', color: colors.textMuted }}>
+                      {lang === 'bn' ? 'তারিখ পর্যন্ত' : 'To Date'}
+                    </Text>
+                    <Text style={{ fontSize: 11.5, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                      {bookingsDateTo
+                        ? (() => {
+                            const [y, m, d] = bookingsDateTo.split('-').map(Number);
+                            return lang === 'bn'
+                              ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                              : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                          })()
+                        : lang === 'bn'
+                        ? 'সব তারিখ'
+                        : 'All Dates'}
+                    </Text>
+                  </View>
+                  <Ionicons name="calendar-outline" size={15} color={colors.primary} />
+                </TouchableOpacity>
+
+                {(bookingsDateFrom || bookingsDateTo) && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      setBookingsDateFrom('');
+                      setBookingsDateTo('');
+                      setBookingsVisibleCount(5);
+                    }}
+                    style={[styles.retryPill, { backgroundColor: colors.crimsonSoft, paddingVertical: 10 }]}
+                  >
+                    <Text style={{ color: colors.crimson, fontWeight: '800', fontSize: 11 }}>
+                      {lang === 'bn' ? 'সব' : 'All'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+
               {filteredBookings.slice(0, bookingsVisibleCount).map((b) => (
                 <TouchableOpacity
                   key={b.id}
@@ -1950,20 +2181,6 @@ export default function App() {
                     </Text>
                   </View>
                 </>
-              )}
-
-              {activeRole === 'OWNER' && (
-                <TouchableOpacity
-                  onPress={openClubSettings}
-                  style={[styles.card, { backgroundColor: colors.primarySoft, borderColor: colors.primary }]}
-                >
-                  <Text style={{ fontWeight: '800', color: colors.primary }}>
-                    🎨 {lang === 'bn' ? 'ক্লাব ব্র্যান্ডিং, লোগো, ঠিকানা ও রঙ কাস্টমাইজ' : 'Customize Club Logo, Name, Address & Theme'}
-                  </Text>
-                  <Text style={{ fontSize: 11, color: colors.textMuted, marginTop: 2 }}>
-                    {lang === 'bn' ? 'লোগো, ক্লাবের নাম, একাধিক ফোন নম্বর ও ইমেইল পরিবর্তন করুন' : 'Edit logo, multiple phones, email & theme color'}
-                  </Text>
-                </TouchableOpacity>
               )}
 
               <TouchableOpacity
@@ -2371,6 +2588,165 @@ export default function App() {
               </View>
 
               <View style={{ gap: 10, marginTop: 14 }}>
+                {activeRole === 'OWNER' && activeRoom?.join_code && (
+                  <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.gold, gap: 8 }]}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Text style={{ fontWeight: '800', color: colors.text, fontSize: 13.5 }}>
+                        🔑 {lang === 'bn' ? 'রুম আইডি (Room ID / Join Code)' : 'Room ID (Join Code)'}
+                      </Text>
+                      <TouchableOpacity
+                        onPress={() => setShowRoomCode((v) => !v)}
+                        style={[styles.retryPill, { backgroundColor: colors.cardAlt }]}
+                      >
+                        <Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>
+                          {showRoomCode
+                            ? lang === 'bn' ? 'লুকান' : 'Hide'
+                            : lang === 'bn' ? 'দেখুন' : 'Show'}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    <View
+                      style={{
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        backgroundColor: colors.bg,
+                        borderWidth: 1,
+                        borderColor: colors.border,
+                        borderRadius: 10,
+                        paddingHorizontal: 12,
+                        paddingVertical: 10,
+                      }}
+                    >
+                      <Text style={{ fontSize: 17, fontWeight: '800', letterSpacing: 2, color: colors.primary }}>
+                        {showRoomCode ? activeRoom.join_code : '••••••••'}
+                      </Text>
+                      <TouchableOpacity
+                        onPress={async () => {
+                          await Clipboard.setStringAsync(String(activeRoom.join_code));
+                          setCopiedRoomCode(true);
+                          setTimeout(() => setCopiedRoomCode(false), 2000);
+                        }}
+                        style={[styles.retryPill, { backgroundColor: colors.primary }]}
+                      >
+                        <Text style={{ color: '#fff', fontSize: 11.5, fontWeight: '800' }}>
+                          {copiedRoomCode
+                            ? lang === 'bn' ? '✓ কপি হয়েছে' : '✓ Copied'
+                            : lang === 'bn' ? 'কপি' : 'Copy'}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    <TouchableOpacity
+                      disabled={regeneratingCode}
+                      onPress={() => {
+                        Alert.alert(
+                          lang === 'bn' ? 'রুম আইডি পরিবর্তন করবেন?' : 'Regenerate Room ID?',
+                          lang === 'bn'
+                            ? 'নতুন কোড তৈরি করলে পূর্বের রুম আইডি তাৎক্ষণিকভাবে বাতিল হয়ে যাবে এবং কেউ পুরোনো কোড দিয়ে জয়েন করতে পারবে না।'
+                            : 'Generating a new Room ID will invalidate the old code immediately. Are you sure?',
+                          [
+                            { text: lang === 'bn' ? 'বাতিল' : 'Cancel', style: 'cancel' },
+                            {
+                              text: lang === 'bn' ? 'নতুন কোড তৈরি করুন' : 'Regenerate',
+                              style: 'destructive',
+                              onPress: async () => {
+                                setRegeneratingCode(true);
+                                try {
+                                  const res = await apiFetch<{ newJoinCode: string }>(
+                                    `/api/rooms/${activeRoom.id}/regenerate-code`,
+                                    { method: 'POST' }
+                                  );
+                                  setActiveRoom((prev: any) =>
+                                    prev ? { ...prev, join_code: res.newJoinCode } : prev
+                                  );
+                                  setShowRoomCode(true);
+                                  Alert.alert(
+                                    lang === 'bn' ? 'সফল' : 'Success',
+                                    lang === 'bn'
+                                      ? 'নতুন রুম আইডি তৈরি হয়েছে এবং পুরোনো কোড বাতিল করা হয়েছে।'
+                                      : 'New Room ID generated and old code revoked.'
+                                  );
+                                } catch (err: any) {
+                                  Alert.alert('Error', err.message);
+                                } finally {
+                                  setRegeneratingCode(false);
+                                }
+                              },
+                            },
+                          ]
+                        );
+                      }}
+                      style={{
+                        paddingVertical: 8,
+                        borderRadius: 8,
+                        borderWidth: 1,
+                        borderColor: colors.crimson,
+                        backgroundColor: colors.crimsonSoft,
+                      }}
+                    >
+                      <Text style={{ color: colors.crimson, fontWeight: '800', fontSize: 12, textAlign: 'center' }}>
+                        🔄 {regeneratingCode
+                          ? lang === 'bn' ? 'তৈরি হচ্ছে...' : 'Regenerating...'
+                          : lang === 'bn' ? 'রুম আইডি পুনর্নবীকরণ (Regenerate)' : 'Regenerate Room ID'}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
+
+                {activeRole === 'OWNER' && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      setProfileModalOpen(false);
+                      setTimeout(() => openTeamAccessModal(), 150);
+                    }}
+                    style={[styles.card, { backgroundColor: colors.card, borderColor: colors.primary }]}
+                  >
+                    <Text style={{ fontWeight: '800', color: colors.primary }}>
+                      🛡️ {lang === 'bn' ? 'ম্যানেজার/স্টাফ ইনভাইট, পিন রিসেট ও ডিভাইস' : 'Member Invites, PIN Reset & Devices'}
+                    </Text>
+                    <Text style={{ fontSize: 11, color: colors.textMuted, marginTop: 2 }}>
+                      {lang === 'bn' ? 'এক-ব্যবহারযোগ্য কোড তৈরি, পিন রিসেট এবং ডিভাইস নিয়ন্ত্রণ করুন' : 'Create single-use codes, reset PINs & manage devices'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                {activeRole === 'OWNER' && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      setProfileModalOpen(false);
+                      setTimeout(() => openClubSettings(), 150);
+                    }}
+                    style={[styles.card, { backgroundColor: colors.primarySoft, borderColor: colors.primary }]}
+                  >
+                    <Text style={{ fontWeight: '800', color: colors.primary }}>
+                      🎨 {lang === 'bn' ? 'ক্লাব ব্র্যান্ডিং, লোগো, ঠিকানা ও রঙ কাস্টমাইজ' : 'Customize Club Logo, Name, Address & Theme'}
+                    </Text>
+                    <Text style={{ fontSize: 11, color: colors.textMuted, marginTop: 2 }}>
+                      {lang === 'bn' ? 'লোগো, ক্লাবের নাম, একাধিক ফোন নম্বর ও ইমেইল পরিবর্তন করুন' : 'Edit logo, multiple phones, email & theme color'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                <TouchableOpacity
+                  onPress={async () => {
+                    try {
+                      await Share.share({
+                        message:
+                          lang === 'bn'
+                            ? `${activeRoom?.name || 'লিলি কমিউনিটি সেন্টার'} — হল বুকিং ও হিসাব ব্যবস্থাপনা অ্যাপ`
+                            : `${activeRoom?.name || 'Lily Community Center'} — Hall Booking & Management App`,
+                      });
+                    } catch { }
+                  }}
+                  style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}
+                >
+                  <Text style={{ fontWeight: '800', color: colors.text, textAlign: 'center' }}>
+                    📤 {lang === 'bn' ? 'অ্যাপটি শেয়ার করুন' : 'Share App'}
+                  </Text>
+                </TouchableOpacity>
+
                 <TouchableOpacity
                   onPress={() => {
                     setProfileModalOpen(false);
@@ -2519,85 +2895,53 @@ export default function App() {
             </View>
 
             <View style={{ padding: 14, gap: 10 }}>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
-                {(
-                  [
-                    { key: 'DAY', bn: 'আজ (Date)', en: 'Today' },
-                    { key: 'MONTH', bn: 'এই মাস (Month)', en: 'This Month' },
-                    { key: 'YEAR', bn: 'এই বছর (Year)', en: 'This Year' },
-                    { key: 'CUSTOM', bn: 'তারিখ থেকে তারিখ', en: 'Custom Range' },
-                  ] as const
-                ).map((p) => {
-                  const active = homePeriod === p.key;
-                  return (
-                    <TouchableOpacity
-                      key={p.key}
-                      onPress={() => setHomePeriod(p.key)}
-                      style={[
-                        styles.filterChip,
-                        {
-                          backgroundColor: active ? colors.primary : colors.card,
-                          borderColor: active ? colors.primary : colors.border,
-                        },
-                      ]}
-                    >
-                      <Text style={{ color: active ? '#fff' : colors.text, fontSize: 12, fontWeight: '800' }}>
-                        {lang === 'bn' ? p.bn : p.en}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
+              <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
+                <TouchableOpacity
+                  onPress={() => setDatePickerTarget('FROM')}
+                  style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
+                      {lang === 'bn' ? 'শুরুর তারিখ' : 'From Date'}
+                    </Text>
+                    <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                      {customFrom
+                        ? (() => {
+                            const [y, m, d] = customFrom.split('-').map(Number);
+                            return lang === 'bn'
+                              ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                              : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                          })()
+                        : 'Select'}
+                    </Text>
+                  </View>
+                  <Ionicons name="calendar-outline" size={16} color={colors.primary} />
+                </TouchableOpacity>
 
-              {homePeriod === 'CUSTOM' && (
-                <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
-                  <TouchableOpacity
-                    onPress={() => setDatePickerTarget('FROM')}
-                    style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
-                  >
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
-                        {lang === 'bn' ? 'শুরুর তারিখ' : 'From Date'}
-                      </Text>
-                      <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
-                        {customFrom
-                          ? (() => {
-                              const [y, m, d] = customFrom.split('-').map(Number);
-                              return lang === 'bn'
-                                ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
-                                : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
-                            })()
-                          : 'Select'}
-                      </Text>
-                    </View>
-                    <Ionicons name="calendar-outline" size={16} color={colors.primary} />
-                  </TouchableOpacity>
+                <Text style={{ color: colors.textMuted, fontWeight: '800' }}>→</Text>
 
-                  <Text style={{ color: colors.textMuted, fontWeight: '800' }}>→</Text>
-
-                  <TouchableOpacity
-                    onPress={() => setDatePickerTarget('TO')}
-                    style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
-                  >
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
-                        {lang === 'bn' ? 'শেষ তারিখ' : 'To Date'}
-                      </Text>
-                      <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
-                        {customTo
-                          ? (() => {
-                              const [y, m, d] = customTo.split('-').map(Number);
-                              return lang === 'bn'
-                                ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
-                                : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
-                            })()
-                          : 'Select'}
-                      </Text>
-                    </View>
-                    <Ionicons name="calendar-outline" size={16} color={colors.primary} />
-                  </TouchableOpacity>
-                </View>
-              )}
+                <TouchableOpacity
+                  onPress={() => setDatePickerTarget('TO')}
+                  style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
+                      {lang === 'bn' ? 'শেষ তারিখ' : 'To Date'}
+                    </Text>
+                    <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                      {customTo
+                        ? (() => {
+                            const [y, m, d] = customTo.split('-').map(Number);
+                            return lang === 'bn'
+                              ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                              : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                          })()
+                        : 'Select'}
+                    </Text>
+                  </View>
+                  <Ionicons name="calendar-outline" size={16} color={colors.primary} />
+                </TouchableOpacity>
+              </View>
 
               <View style={[styles.card, { backgroundColor: colors.crimsonSoft, borderColor: colors.crimson, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]}>
                 <Text style={{ fontWeight: '800', color: colors.crimson, fontSize: 14 }}>
@@ -2632,6 +2976,301 @@ export default function App() {
                       {formatCurrency(ex.amount, lang)}
                     </Text>
                   </View>
+                ))
+              )}
+            </ScrollView>
+          </SafeScreen>
+        </Modal>
+
+        {/* Home Income Breakdown Modal (Who Paid, Where From, Selected by Month/Day Calendar) */}
+        <Modal visible={incomeModalOpen} animationType="slide" onRequestClose={() => setIncomeModalOpen(false)}>
+          <SafeScreen backgroundColor={colors.bg}>
+            <View style={[styles.header, { backgroundColor: colors.headerBg, borderBottomColor: colors.border }]}>
+              <TouchableOpacity
+                onPress={() => setIncomeModalOpen(false)}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}
+              >
+                <Ionicons name="chevron-back" size={22} color={colors.text} />
+                <Text style={{ color: colors.text, fontWeight: '700', fontSize: 14 }}>
+                  {lang === 'bn' ? 'পিছনে' : 'Back'}
+                </Text>
+              </TouchableOpacity>
+              <Text style={[styles.headerTitle, { color: colors.text, flex: 1, textAlign: 'center' }]}>
+                {lang === 'bn' ? 'আয়ের বিস্তারিত (Income)' : 'Income Breakdown'}
+              </Text>
+              <TouchableOpacity
+                onPress={() => {
+                  const todayYMD = dashboard?.todayYMD || new Date().toISOString().slice(0, 10);
+                  const y = parseInt(todayYMD.slice(0, 4), 10);
+                  const m = parseInt(todayYMD.slice(5, 7), 10);
+                  const lastDay = new Date(y, m, 0).getDate();
+                  const ym = todayYMD.slice(0, 7);
+                  setCustomFrom(`${ym}-01`);
+                  setCustomTo(`${ym}-${String(lastDay).padStart(2, '0')}`);
+                }}
+                style={[styles.retryPill, { backgroundColor: colors.primarySoft }]}
+              >
+                <Text style={{ color: colors.primary, fontWeight: '800', fontSize: 11 }}>
+                  {lang === 'bn' ? 'চলতি মাস' : 'This Month'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={{ padding: 14, gap: 10 }}>
+              <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
+                <TouchableOpacity
+                  onPress={() => setDatePickerTarget('FROM')}
+                  style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
+                      {lang === 'bn' ? 'শুরুর তারিখ' : 'From Date'}
+                    </Text>
+                    <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                      {customFrom
+                        ? (() => {
+                            const [y, m, d] = customFrom.split('-').map(Number);
+                            return lang === 'bn'
+                              ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                              : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                          })()
+                        : 'Select'}
+                    </Text>
+                  </View>
+                  <Ionicons name="calendar-outline" size={16} color={colors.primary} />
+                </TouchableOpacity>
+
+                <Text style={{ color: colors.textMuted, fontWeight: '800' }}>→</Text>
+
+                <TouchableOpacity
+                  onPress={() => setDatePickerTarget('TO')}
+                  style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
+                      {lang === 'bn' ? 'শেষ তারিখ' : 'To Date'}
+                    </Text>
+                    <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                      {customTo
+                        ? (() => {
+                            const [y, m, d] = customTo.split('-').map(Number);
+                            return lang === 'bn'
+                              ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                              : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                          })()
+                        : 'Select'}
+                    </Text>
+                  </View>
+                  <Ionicons name="calendar-outline" size={16} color={colors.primary} />
+                </TouchableOpacity>
+              </View>
+
+              <View style={[styles.card, { backgroundColor: colors.primarySoft, borderColor: colors.primary, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]}>
+                <Text style={{ fontWeight: '800', color: colors.primary, fontSize: 14 }}>
+                  {lang === 'bn' ? 'মোট সংগৃহীত আয়:' : 'Total Collected Income:'}
+                </Text>
+                <Text style={{ fontWeight: '800', color: colors.primary, fontSize: 18 }}>
+                  {formatCurrency(periodPaymentsTotal, lang)}
+                </Text>
+              </View>
+            </View>
+
+            <ScrollView contentContainerStyle={{ paddingHorizontal: 14, paddingBottom: 30, gap: 10 }}>
+              {periodPayments.length === 0 ? (
+                <Text style={{ textAlign: 'center', color: colors.textMuted, marginTop: 24 }}>
+                  {lang === 'bn' ? 'এই সময়ে কোনো পেমেন্ট পাওয়া যায়নি।' : 'No payments received in this period.'}
+                </Text>
+              ) : (
+                periodPayments.map((p) => (
+                  <TouchableOpacity
+                    key={p.id}
+                    onPress={() => {
+                      setIncomeModalOpen(false);
+                      setDetailBookingId(p.booking_id);
+                    }}
+                    style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border, gap: 4 }]}
+                  >
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Text style={{ fontWeight: '800', color: colors.text, fontSize: 15, flex: 1 }}>
+                        {p.customer_name}
+                      </Text>
+                      <Text
+                        style={{
+                          fontWeight: '800',
+                          fontSize: 15,
+                          color: p.amount < 0 ? '#DC2626' : colors.primary,
+                        }}
+                      >
+                        {p.amount >= 0 ? '+' : ''}
+                        {formatCurrency(p.amount, lang)}
+                      </Text>
+                    </View>
+                    <Text style={{ fontSize: 12, color: colors.primary, fontWeight: '700' }}>
+                      📞 {p.customer_phone}
+                      {p.customer_address ? ` • 📍 ${p.customer_address}` : ''}
+                    </Text>
+                    <Text style={{ fontSize: 12, color: colors.textMuted }}>
+                      🏛️ {p.hall_name} ({p.slot}) • #{p.booking_number}
+                    </Text>
+                    <Text style={{ fontSize: 11.5, color: colors.textMuted }}>
+                      🎉 {lang === 'bn' ? 'অনুষ্ঠান:' : 'Event:'} {formatDualDateFromYMD(p.event_date, lang)}
+                    </Text>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 5, marginTop: 3 }}>
+                      <Text style={{ fontSize: 11, color: colors.textMuted, fontWeight: '700' }}>
+                        💳 {p.payment_type} ({p.method}) • #{p.receipt_number}
+                      </Text>
+                      <Text style={{ fontSize: 11, color: colors.textMuted, fontWeight: '700' }}>
+                        📅 {formatDualDateFromYMD(p.payment_date, lang)}
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
+          </SafeScreen>
+        </Modal>
+
+        {/* Home Revenue Breakdown Modal (Who Contributes + Paid + Dues for Selected Dates) */}
+        <Modal visible={revenueModalOpen} animationType="slide" onRequestClose={() => setRevenueModalOpen(false)}>
+          <SafeScreen backgroundColor={colors.bg}>
+            <View style={[styles.header, { backgroundColor: colors.headerBg, borderBottomColor: colors.border }]}>
+              <TouchableOpacity
+                onPress={() => setRevenueModalOpen(false)}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}
+              >
+                <Ionicons name="chevron-back" size={22} color={colors.text} />
+                <Text style={{ color: colors.text, fontWeight: '700', fontSize: 14 }}>
+                  {lang === 'bn' ? 'পিছনে' : 'Back'}
+                </Text>
+              </TouchableOpacity>
+              <Text style={[styles.headerTitle, { color: colors.text, flex: 1, textAlign: 'center' }]}>
+                {lang === 'bn' ? 'মোট রাজস্বের বিস্তারিত' : 'Revenue Breakdown'}
+              </Text>
+              <TouchableOpacity
+                onPress={() => {
+                  const todayYMD = dashboard?.todayYMD || new Date().toISOString().slice(0, 10);
+                  const y = parseInt(todayYMD.slice(0, 4), 10);
+                  const m = parseInt(todayYMD.slice(5, 7), 10);
+                  const lastDay = new Date(y, m, 0).getDate();
+                  const ym = todayYMD.slice(0, 7);
+                  setCustomFrom(`${ym}-01`);
+                  setCustomTo(`${ym}-${String(lastDay).padStart(2, '0')}`);
+                }}
+                style={[styles.retryPill, { backgroundColor: colors.primarySoft }]}
+              >
+                <Text style={{ color: colors.primary, fontWeight: '800', fontSize: 11 }}>
+                  {lang === 'bn' ? 'চলতি মাস' : 'This Month'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={{ padding: 14, gap: 10 }}>
+              <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
+                <TouchableOpacity
+                  onPress={() => setDatePickerTarget('FROM')}
+                  style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
+                      {lang === 'bn' ? 'শুরুর তারিখ' : 'From Date'}
+                    </Text>
+                    <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                      {customFrom
+                        ? (() => {
+                            const [y, m, d] = customFrom.split('-').map(Number);
+                            return lang === 'bn'
+                              ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                              : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                          })()
+                        : 'Select'}
+                    </Text>
+                  </View>
+                  <Ionicons name="calendar-outline" size={16} color={colors.primary} />
+                </TouchableOpacity>
+
+                <Text style={{ color: colors.textMuted, fontWeight: '800' }}>→</Text>
+
+                <TouchableOpacity
+                  onPress={() => setDatePickerTarget('TO')}
+                  style={[styles.searchBox, { backgroundColor: colors.card, borderColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 9.5, fontWeight: '700', color: colors.textMuted }}>
+                      {lang === 'bn' ? 'শেষ তারিখ' : 'To Date'}
+                    </Text>
+                    <Text style={{ fontSize: 12, fontWeight: '800', color: colors.text }} numberOfLines={1}>
+                      {customTo
+                        ? (() => {
+                            const [y, m, d] = customTo.split('-').map(Number);
+                            return lang === 'bn'
+                              ? `${toBanglaDigits(d)} ${EN_MONTHS_BN[m - 1]} ${toBanglaDigits(y)}`
+                              : `${d} ${EN_MONTHS[m - 1].slice(0, 3)} ${y}`;
+                          })()
+                        : 'Select'}
+                    </Text>
+                  </View>
+                  <Ionicons name="calendar-outline" size={16} color={colors.primary} />
+                </TouchableOpacity>
+              </View>
+
+              <View style={[styles.card, { backgroundColor: colors.goldSoft, borderColor: colors.gold, gap: 4 }]}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Text style={{ fontWeight: '800', color: colors.gold, fontSize: 14 }}>
+                    {lang === 'bn' ? 'মোট রাজস্ব (Total Revenue):' : 'Total Revenue:'}
+                  </Text>
+                  <Text style={{ fontWeight: '800', color: colors.gold, fontSize: 18 }}>
+                    {formatCurrency(periodReport?.revenue ?? 0, lang)}
+                  </Text>
+                </View>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                  <Text style={{ fontSize: 12, fontWeight: '700', color: colors.primary }}>
+                    {lang === 'bn' ? 'সংগৃহীত:' : 'Collected:'} {formatCurrency(periodReport?.collected ?? 0, lang)}
+                  </Text>
+                  <Text style={{ fontSize: 12, fontWeight: '800', color: '#DC2626' }}>
+                    {lang === 'bn' ? 'মোট বকেয়া:' : 'Total Dues:'} {formatCurrency(periodReport?.due ?? 0, lang)}
+                  </Text>
+                </View>
+              </View>
+            </View>
+
+            <ScrollView contentContainerStyle={{ paddingHorizontal: 14, paddingBottom: 30, gap: 10 }}>
+              {periodBookings.length === 0 ? (
+                <Text style={{ textAlign: 'center', color: colors.textMuted, marginTop: 24 }}>
+                  {lang === 'bn' ? 'এই সময়ে কোনো রাজস্ব বুকিং নেই।' : 'No revenue bookings in this period.'}
+                </Text>
+              ) : (
+                periodBookings.map((b) => (
+                  <TouchableOpacity
+                    key={b.id}
+                    onPress={() => {
+                      setRevenueModalOpen(false);
+                      setDetailBookingId(b.id);
+                    }}
+                    style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border, gap: 4 }]}
+                  >
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Text style={{ fontWeight: '800', color: colors.text, fontSize: 15, flex: 1 }}>
+                        {b.customer_name}
+                      </Text>
+                      <Text style={{ fontWeight: '800', color: colors.gold, fontSize: 15 }}>
+                        {formatCurrency(b.total_amount, lang)}
+                      </Text>
+                    </View>
+                    <Text style={{ fontSize: 12, color: colors.primary, fontWeight: '700' }}>
+                      📞 {b.customer_phone} • #{b.booking_number}
+                    </Text>
+                    <Text style={{ fontSize: 12, color: colors.textMuted }}>
+                      🏛️ {b.hall_name} ({b.slot}) • 📅 {formatDualDateFromYMD(b.event_date, lang)}
+                    </Text>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 5, marginTop: 3 }}>
+                      <Text style={{ fontSize: 11.5, color: colors.primary, fontWeight: '700' }}>
+                        {lang === 'bn' ? 'জমা:' : 'Paid:'} {formatCurrency(b.paid_amount ?? b.advance_amount ?? 0, lang)}
+                      </Text>
+                      <Text style={{ fontSize: 12, color: Number(b.due_amount) > 0 ? '#DC2626' : colors.primary, fontWeight: '800' }}>
+                        {lang === 'bn' ? 'বকেয়া:' : 'Due:'} {formatCurrency(b.due_amount ?? 0, lang)}
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
                 ))
               )}
             </ScrollView>
@@ -2711,6 +3350,203 @@ export default function App() {
                   </TouchableOpacity>
                 ))
               )}
+            </ScrollView>
+          </SafeScreen>
+        </Modal>
+
+        {/* Owner-Only Member Invites, PIN Reset & Devices Modal */}
+        <Modal visible={teamAccessModalOpen && activeRole === 'OWNER'} animationType="slide" onRequestClose={() => setTeamAccessModalOpen(false)}>
+          <SafeScreen backgroundColor={colors.bg}>
+            <View style={[styles.header, { backgroundColor: colors.headerBg, borderBottomColor: colors.border }]}>
+              <TouchableOpacity
+                onPress={() => {
+                  setGeneratedInviteCode(null);
+                  setTeamAccessModalOpen(false);
+                }}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}
+              >
+                <Ionicons name="chevron-back" size={22} color={colors.text} />
+                <Text style={{ color: colors.text, fontWeight: '700', fontSize: 14 }}>
+                  {lang === 'bn' ? 'পিছনে' : 'Back'}
+                </Text>
+              </TouchableOpacity>
+              <Text style={[styles.headerTitle, { color: colors.text, flex: 1, textAlign: 'center' }]}>
+                {lang === 'bn' ? 'টিম ইনভাইট ও ডিভাইস' : 'Invites & Devices'}
+              </Text>
+              <View style={{ width: 48 }} />
+            </View>
+
+            <ScrollView contentContainerStyle={{ padding: 14, gap: 12, paddingBottom: 36 }}>
+              {/* Create Single-Use Invite */}
+              <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border, gap: 8 }]}>
+                <Text style={{ fontWeight: '800', color: colors.text, fontSize: 14 }}>
+                  ➕ {lang === 'bn' ? 'নতুন ম্যানেজার বা স্টাফ ইনভাইট' : 'Add Manager or Staff (Single-Use Code)'}
+                </Text>
+                <TextInput
+                  value={newInviteName}
+                  onChangeText={setNewInviteName}
+                  placeholder={lang === 'bn' ? 'সদস্যের নাম লিখুন' : 'Member Name'}
+                  placeholderTextColor={colors.textMuted}
+                  style={[styles.inputBox, { borderColor: colors.border, color: colors.text }]}
+                />
+                <View style={{ flexDirection: 'row', gap: 8 }}>
+                  {(['MANAGER', 'STAFF'] as const).map((r) => (
+                    <TouchableOpacity
+                      key={r}
+                      onPress={() => setNewInviteRole(r)}
+                      style={[
+                        styles.modalBtn,
+                        {
+                          backgroundColor: newInviteRole === r ? colors.primary : colors.bg,
+                          borderWidth: 1,
+                          borderColor: newInviteRole === r ? colors.primary : colors.border,
+                        },
+                      ]}
+                    >
+                      <Text style={{ color: newInviteRole === r ? '#fff' : colors.text, fontWeight: '800', fontSize: 12 }}>
+                        {r === 'MANAGER' ? (lang === 'bn' ? 'ম্যানেজার (Manager)' : 'Manager') : (lang === 'bn' ? 'স্টাফ (Staff)' : 'Staff')}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+                <TouchableOpacity
+                  onPress={handleCreateInvite}
+                  disabled={creatingInvite}
+                  style={[styles.primaryFullBtn, { backgroundColor: colors.primary, opacity: creatingInvite ? 0.7 : 1 }]}
+                >
+                  {creatingInvite ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={styles.primaryFullBtnText}>
+                      {lang === 'bn' ? 'এক-ব্যবহারযোগ্য কোড তৈরি করুন (২৪ ঘণ্টা)' : 'Generate Single-Use Code (24h)'}
+                    </Text>
+                  )}
+                </TouchableOpacity>
+
+                {generatedInviteCode && (
+                  <View style={{ backgroundColor: colors.primarySoft, borderColor: colors.primary, borderWidth: 1, borderRadius: 10, padding: 10, gap: 6 }}>
+                    <Text style={{ fontSize: 11, fontWeight: '700', color: colors.crimson }}>
+                      ⚠️ {lang === 'bn' ? 'এই কোডটি শুধুমাত্র একবারই দেখানো হবে! এখনই কপি করে নিন:' : 'Shown ONCE only! Copy and share securely now:'}
+                    </Text>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Text style={{ fontSize: 18, fontWeight: '800', letterSpacing: 2, color: colors.primary }}>
+                        {generatedInviteCode}
+                      </Text>
+                      <TouchableOpacity
+                        onPress={async () => {
+                          await Clipboard.setStringAsync(generatedInviteCode);
+                          setCopiedInviteCode(true);
+                          setTimeout(() => setCopiedInviteCode(false), 2000);
+                        }}
+                        style={[styles.retryPill, { backgroundColor: colors.primary }]}
+                      >
+                        <Text style={{ color: '#fff', fontSize: 11.5, fontWeight: '800' }}>
+                          {copiedInviteCode ? (lang === 'bn' ? '✓ কপি হয়েছে' : '✓ Copied') : (lang === 'bn' ? 'কপি' : 'Copy')}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                )}
+              </View>
+
+              {/* Devices List */}
+              <Text style={[styles.secHeading, { color: colors.text }]}>
+                📱 {lang === 'bn' ? 'সদস্যদের ডিভাইস' : 'Member Devices'} ({devicesList.length})
+              </Text>
+              {devicesList.length === 0 ? (
+                <Text style={{ color: colors.textMuted, fontSize: 12 }}>
+                  {lang === 'bn' ? 'কোনো সদস্যের ডিভাইস নিবন্ধিত নেই।' : 'No member devices registered yet.'}
+                </Text>
+              ) : (
+                devicesList.map((d) => (
+                  <View key={d.id} style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border, gap: 6 }]}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Text style={{ fontWeight: '800', color: colors.text, fontSize: 14 }}>
+                        {d.user_name} ({d.user_role})
+                      </Text>
+                      <Text style={{ fontSize: 11, fontWeight: '800', color: d.status === 'REVOKED' ? colors.crimson : colors.primary }}>
+                        {d.status}
+                      </Text>
+                    </View>
+                    <Text style={{ fontSize: 12, color: colors.textMuted }}>{d.device_name}</Text>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                      <TouchableOpacity
+                        onPress={async () => {
+                          const next = d.status === 'REVOKED' ? 'APPROVED' : 'REVOKED';
+                          await apiFetch(`/api/rooms/${activeRoom.id}/devices/${d.id}`, {
+                            method: 'PATCH',
+                            body: JSON.stringify({ status: next }),
+                          });
+                          const devRes = await apiFetch<{ devices: any[] }>(`/api/rooms/${activeRoom.id}/devices`);
+                          setDevicesList(devRes.devices || []);
+                        }}
+                        style={[
+                          styles.retryPill,
+                          { backgroundColor: d.status === 'REVOKED' ? colors.primary : colors.crimson },
+                        ]}
+                      >
+                        <Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>
+                          {d.status === 'REVOKED'
+                            ? lang === 'bn' ? 'পুনরায় অনুমোদন' : 'Approve'
+                            : lang === 'bn' ? 'ডিভাইস বাতিল' : 'Revoke'}
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        onPress={async () => {
+                          try {
+                            const res = await apiFetch<{ inviteCode: string }>(
+                              `/api/rooms/${activeRoom.id}/members/${d.user_id}/reset-pin`,
+                              { method: 'POST' }
+                            );
+                            setGeneratedInviteCode(res.inviteCode);
+                            Alert.alert(
+                              lang === 'bn' ? 'পিন রিসেট সফল' : 'PIN Reset',
+                              lang === 'bn' ? 'নতুন ইনভাইট কোড উপরে দেখানো হয়েছে এবং পুরোনো সব সেশন বাতিল হয়েছে।' : 'New single-use code shown above and all old sessions revoked.'
+                            );
+                          } catch (err: any) {
+                            Alert.alert('Error', err.message);
+                          }
+                        }}
+                        style={[styles.retryPill, { backgroundColor: colors.gold }]}
+                      >
+                        <Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>
+                          {lang === 'bn' ? 'পিন রিসেট' : 'Reset PIN'}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                ))
+              )}
+
+              {/* Invites History */}
+              <Text style={[styles.secHeading, { color: colors.text }]}>
+                ✉️ {lang === 'bn' ? 'ইনভাইট তালিকা' : 'Invites'} ({invitesList.length})
+              </Text>
+              {invitesList.map((inv) => {
+                const statusTxt = inv.used_at ? 'USED' : inv.revoked_at ? 'REVOKED' : inv.expires_at < Date.now() ? 'EXPIRED' : 'ACTIVE';
+                return (
+                  <View key={inv.id} style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]}>
+                    <View>
+                      <Text style={{ fontWeight: '800', color: colors.text }}>{inv.member_name} ({inv.role})</Text>
+                      <Text style={{ fontSize: 11, color: colors.textMuted }}>{statusTxt}</Text>
+                    </View>
+                    {statusTxt === 'ACTIVE' && (
+                      <TouchableOpacity
+                        onPress={async () => {
+                          await apiFetch(`/api/rooms/${activeRoom.id}/invites/${inv.id}`, { method: 'DELETE' });
+                          const invRes = await apiFetch<{ invites: any[] }>(`/api/rooms/${activeRoom.id}/invites`);
+                          setInvitesList(invRes.invites || []);
+                        }}
+                        style={[styles.retryPill, { backgroundColor: colors.crimson }]}
+                      >
+                        <Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>
+                          {lang === 'bn' ? 'বাতিল' : 'Revoke'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                );
+              })}
             </ScrollView>
           </SafeScreen>
         </Modal>
@@ -2845,7 +3681,7 @@ export default function App() {
         <DatePickerModal
           visible={datePickerTarget !== null}
           title={
-            datePickerTarget === 'FROM'
+            datePickerTarget === 'FROM' || datePickerTarget === 'BOOKINGS_FROM'
               ? lang === 'bn'
                 ? 'শুরুর তারিখ নির্বাচন করুন'
                 : 'Select From Date'
@@ -2853,7 +3689,15 @@ export default function App() {
               ? 'শেষ তারিখ নির্বাচন করুন'
               : 'Select To Date'
           }
-          valueYMD={datePickerTarget === 'FROM' ? customFrom : customTo}
+          valueYMD={
+            datePickerTarget === 'FROM'
+              ? customFrom
+              : datePickerTarget === 'TO'
+              ? customTo
+              : datePickerTarget === 'BOOKINGS_FROM'
+              ? bookingsDateFrom
+              : bookingsDateTo
+          }
           lang={lang}
           colors={colors}
           onClose={() => setDatePickerTarget(null)}
@@ -2861,9 +3705,17 @@ export default function App() {
             if (datePickerTarget === 'FROM') {
               setCustomFrom(ymd);
               if (customTo && ymd > customTo) setCustomTo(ymd);
-            } else {
+            } else if (datePickerTarget === 'TO') {
               setCustomTo(ymd);
               if (customFrom && ymd < customFrom) setCustomFrom(ymd);
+            } else if (datePickerTarget === 'BOOKINGS_FROM') {
+              setBookingsDateFrom(ymd);
+              if (bookingsDateTo && ymd > bookingsDateTo) setBookingsDateTo(ymd);
+              setBookingsVisibleCount(5);
+            } else if (datePickerTarget === 'BOOKINGS_TO') {
+              setBookingsDateTo(ymd);
+              if (bookingsDateFrom && ymd < bookingsDateFrom) setBookingsDateFrom(ymd);
+              setBookingsVisibleCount(5);
             }
           }}
         />
@@ -2893,14 +3745,51 @@ function renderServerModal(
           <Text style={[styles.secHeading, { color: colors.text }]}>
             {lang === 'bn' ? 'সার্ভার ঠিকানা (URL)' : 'Server URL'}
           </Text>
+          <Text style={{ fontSize: 11, color: colors.textMuted, marginBottom: 8 }}>
+            {lang === 'bn'
+              ? 'নেটওয়ার্ক পরিবর্তন হলেও Cloud Tunnel দিয়ে যে কোনো স্থান বা সিম ডাটা থেকে টেস্ট করা যায়।'
+              : 'Cloud Tunnel works across all Wi-Fi networks and mobile cellular data.'}
+          </Text>
           <TextInput
             value={val}
             onChangeText={setVal}
             autoCapitalize="none"
-            placeholder="http://10.218.141.155:8081"
+            placeholder="https://lily-cc-api.loca.lt"
             style={[styles.inputBox, { borderColor: colors.border, color: colors.text }]}
           />
-          <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
+          <View style={{ flexDirection: 'row', gap: 6, marginVertical: 8, flexWrap: 'wrap' }}>
+            <TouchableOpacity
+              onPress={() => setVal('http://172.15.15.220:3000')}
+              style={{
+                backgroundColor: colors.cardAlt,
+                paddingHorizontal: 8,
+                paddingVertical: 5,
+                borderRadius: 6,
+                borderWidth: 1,
+                borderColor: colors.primary,
+              }}
+            >
+              <Text style={{ fontSize: 11, fontWeight: '700', color: colors.primary }}>
+                🏠 Local Wi-Fi (172.15.15.220)
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setVal('https://bad-goat-46.loca.lt')}
+              style={{
+                backgroundColor: colors.cardAlt,
+                paddingHorizontal: 8,
+                paddingVertical: 5,
+                borderRadius: 6,
+                borderWidth: 1,
+                borderColor: colors.border,
+              }}
+            >
+              <Text style={{ fontSize: 11, fontWeight: '700', color: colors.text }}>
+                🌐 Cloud Tunnel
+              </Text>
+            </TouchableOpacity>
+          </View>
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 4 }}>
             <TouchableOpacity onPress={() => setVisible(false)} style={[styles.modalBtn, { backgroundColor: colors.cardAlt }]}>
               <Text style={{ color: colors.text, fontWeight: '700' }}>{lang === 'bn' ? 'বাতিল' : 'Cancel'}</Text>
             </TouchableOpacity>

@@ -16,6 +16,9 @@ import { useAuth } from '../context/AuthContext.js';
 import { useTheme } from '../context/ThemeContext.js';
 import { DateBadge } from './DateBadge.js';
 import { Modal } from './Modal.js';
+import { ActionButton } from './ActionButton.js';
+import { PrivacyPolicyModal, DeleteAccountModal } from './PrivacyAndAccountModal.js';
+import { useToast } from './Toast.js';
 import { SlotBadge, type SlotType } from './SlotBadge.js';
 import {
   formatDualDate,
@@ -36,16 +39,20 @@ export const Navbar: React.FC<{
     language,
     setLanguage,
     switchRoom,
+    deleteAccount,
     logout,
     logoutAll,
     t,
   } = useAuth();
   const { theme, toggleTheme } = useTheme();
+  const { showError, showSuccess } = useToast();
 
   const [roomDropdownOpen, setRoomDropdownOpen] = useState(false);
   const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
   const [notifDropdownOpen, setNotifDropdownOpen] = useState(false);
   const [logoutAllModalOpen, setLogoutAllModalOpen] = useState(false);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
 
   const [notifications, setNotifications] = useState<any[]>([]);
   const [unreadCount, setUnreadCount] = useState<number>(0);
@@ -383,6 +390,17 @@ export const Navbar: React.FC<{
                       <button
                         onClick={() => {
                           setProfileDropdownOpen(false);
+                          setPrivacyOpen(true);
+                        }}
+                        className="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 rounded-xl transition-colors cursor-pointer"
+                      >
+                        <Globe className="w-4 h-4 text-[#4A2545] dark:text-[#C5A059]" />
+                        <span>{language === 'bn' ? 'গোপনীয়তা নীতি' : 'Privacy Policy'}</span>
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          setProfileDropdownOpen(false);
                           logout();
                         }}
                         className="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 rounded-xl transition-colors cursor-pointer"
@@ -400,6 +418,17 @@ export const Navbar: React.FC<{
                       >
                         <ShieldAlert className="w-4 h-4 text-amber-500" />
                         <span>{t('signOutAllDevices')}</span>
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          setProfileDropdownOpen(false);
+                          setDeleteAccountOpen(true);
+                        }}
+                        className="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold text-rose-700 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 rounded-xl transition-colors cursor-pointer"
+                      >
+                        <ShieldAlert className="w-4 h-4 text-rose-600" />
+                        <span>{language === 'bn' ? 'অ্যাকাউন্ট মুছে ফেলুন' : 'Delete Account'}</span>
                       </button>
                     </div>
                   </div>
@@ -421,24 +450,41 @@ export const Navbar: React.FC<{
             {t('signOutAllConfirm')}
           </p>
           <div className="flex items-center justify-end gap-3 pt-3">
-            <button
-              onClick={() => setLogoutAllModalOpen(false)}
-              className="px-4 py-2 text-xs sm:text-sm font-semibold text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 rounded-xl transition-colors"
-            >
+            <ActionButton variant="ghost" onClick={() => setLogoutAllModalOpen(false)}>
               {t('cancel')}
-            </button>
-            <button
-              onClick={() => {
+            </ActionButton>
+            <ActionButton
+              variant="danger"
+              onClick={async () => {
                 setLogoutAllModalOpen(false);
-                logoutAll();
+                await logoutAll();
               }}
-              className="px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded-xl shadow-xs transition-colors"
             >
               {t('signOutAllDevices')}
-            </button>
+            </ActionButton>
           </div>
         </div>
       </Modal>
+
+      <PrivacyPolicyModal
+        isOpen={privacyOpen}
+        onClose={() => setPrivacyOpen(false)}
+        language={language}
+      />
+
+      <DeleteAccountModal
+        isOpen={deleteAccountOpen}
+        onClose={() => setDeleteAccountOpen(false)}
+        language={language}
+        onConfirmDelete={async () => {
+          try {
+            await deleteAccount();
+            showSuccess(language === 'bn' ? 'অ্যাকাউন্ট মুছে ফেলা হয়েছে।' : 'Account deleted.');
+          } catch (err: any) {
+            showError((language === 'bn' ? err.messageBn : err.messageEn) || err.message);
+          }
+        }}
+      />
     </>
   );
 };

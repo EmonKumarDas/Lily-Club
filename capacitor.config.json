@@ -3,16 +3,16 @@
   "appName": "Lily CC",
   "webDir": "dist/client",
   "server": {
-    "url": "http://10.218.141.155:8081",
-    "cleartext": true
+    "androidScheme": "https",
+    "cleartext": false
   },
   "android": {
-    "allowMixedContent": true
+    "allowMixedContent": false
   },
   "plugins": {
     "SplashScreen": {
       "launchShowDuration": 800,
-      "backgroundColor": "#582C4D"
+      "backgroundColor": "#4A2545"
     }
   }
 }

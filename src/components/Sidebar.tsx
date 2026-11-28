@@ -109,20 +109,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
 
   return (
     <aside className="hidden md:flex flex-col w-64 shrink-0 bg-white dark:bg-[#161317] border-r border-stone-200 dark:border-stone-800 p-4 min-h-[calc(100vh-4rem)]">
-      {/* Active Club Mini Header */}
-      <div className="p-3 mb-4 rounded-xl bg-gradient-to-br from-[#582C4D]/8 to-[#C5A059]/10 border border-[#582C4D]/15 dark:border-[#C5A059]/20">
-        <p className="text-[11px] font-bold text-[#582C4D] dark:text-[#C5A059] uppercase tracking-wider">
+      {/* Active Club Mini Header (Room ID is strictly Owner-only in Profile/Settings, never shown here) */}
+      <div className="p-3.5 mb-4 rounded-2xl bg-gradient-to-br from-[#4A2545]/8 to-[#C5A059]/10 border border-[#4A2545]/15 dark:border-[#C5A059]/20">
+        <p className="text-[11px] font-bold text-[#4A2545] dark:text-[#C5A059] uppercase tracking-wider">
           {t('currentRoom')}
         </p>
         <h2 className="text-sm font-bold text-stone-900 dark:text-stone-100 truncate mt-0.5">
           {activeRoom.name}
         </h2>
-        <div className="flex items-center gap-1.5 mt-2 text-[11px] font-mono font-medium text-stone-600 dark:text-stone-300">
-          <span className="opacity-70">ID:</span>
-          <span className="px-1.5 py-0.5 rounded bg-white/80 dark:bg-black/40 border border-stone-200 dark:border-stone-700 tracking-wider">
-            {activeRoom.join_code}
-          </span>
-        </div>
+        {activeMember?.role && (
+          <p className="text-[11px] font-semibold text-stone-500 dark:text-stone-400 mt-1">
+            {t(`role_${activeMember.role}` as any)}
+          </p>
+        )}
       </div>
 
       {/* Navigation List */}

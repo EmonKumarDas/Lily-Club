@@ -12,6 +12,11 @@ import {
   getRoomMembers,
   updateMemberRole,
   removeMember,
+  suspendMember,
+  cancelJoinRequest,
+  transferRoomOwnership,
+  softDeleteRoom,
+  exportFullRoomData,
   approveJoinRequest,
   rejectJoinRequest,
   regenerateRoomJoinCode,
@@ -45,6 +50,7 @@ import {
   seedPart2DemoData,
   clearPart2DemoData,
   getBookingPayments,
+  listRoomPayments,
   createPayment,
   reversePayment,
   listRoomExpenses,
@@ -68,7 +74,23 @@ import {
   formatCurrency,
   toBanglaDigits,
 } from '../dateUtils.js';
-import { requireAuth, requireRoomMember, requireRole, sanitizeBody } from '../middleware.js';
+import {
+  requireAuth,
+  requireRoomMember,
+  requireRole,
+  sanitizeBody,
+  idempotencyGuard,
+  requireRecentReauth,
+} from '../middleware.js';
+import {
+  createMemberInvite,
+  listRoomInvites,
+  revokeMemberInvite,
+  resetMemberPin,
+  listRoomDevices,
+  updateMemberDeviceStatus,
+  transferRoomOwnership as transferRoomOwnershipAtomic,
+} from '../memberAuth.js';
 
 // Per-user create endpoint rate limiter (max 60 create calls per minute per user)
 const createRateMap = new Map<string, number[]>();
@@ -169,12 +191,22 @@ function validateAndSaveReceiptImage(dataUrl: string): string {
 
 const router = Router();
 
-// Create a new Room
+// Create a new Room (Creator becomes OWNER of that room only; rate-limited & capped per account)
 router.post(
   '/',
   requireAuth,
   sanitizeBody(),
   (req: Request, res: Response) => {
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    if (!checkCreateRateLimit(req.user!.id, clientIp)) {
+      res.status(429).json({
+        error: 'RATE_LIMITED',
+        messageBn: 'অতিরিক্ত রুম তৈরির অনুরোধ পাঠানো হয়েছে। অনুগ্রহ করে একটু পর চেষ্টা করুন।',
+        messageEn: 'Too many room creation requests. Please wait a moment.',
+      });
+      return;
+    }
+
     const schema = z.object({
       name: z.string().min(2, 'Room name must be at least 2 characters').max(100),
       logo: z.string().optional().nullable(),
@@ -194,41 +226,52 @@ router.post(
       return;
     }
 
-    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
-    const room = createRoom(
-      {
-        name: parsed.data.name,
-        logo: parsed.data.logo,
-        address: parsed.data.address,
-        phone: parsed.data.phone,
-        default_language: parsed.data.default_language,
-        createdByUserId: req.user!.id,
-      },
-      {
-        email: req.user!.email,
-        name: req.user!.name,
-        ip: clientIp,
-      }
-    );
+    try {
+      const room = createRoom(
+        {
+          name: parsed.data.name,
+          logo: parsed.data.logo,
+          address: parsed.data.address,
+          phone: parsed.data.phone,
+          default_language: parsed.data.default_language,
+          createdByUserId: req.user!.id,
+        },
+        {
+          userId: req.user!.id,
+          email: req.user!.email,
+          name: req.user!.name,
+          ip: clientIp,
+        }
+      );
 
-    // Set this as the active room in the user's session
-    setSessionActiveRoom(req.session!.id, room.id);
+      setSessionActiveRoom(req.session!.id, room.id);
 
-    res.status(201).json({
-      success: true,
-      room,
-      role: 'OWNER',
-    });
+      res.status(201).json({
+        success: true,
+        room,
+        role: 'OWNER',
+      });
+    } catch (err: any) {
+      res.status(err.status || 400).json({
+        error: err.code || 'ROOM_CREATE_FAILED',
+        messageBn: err.messageBn || err.message,
+        messageEn: err.messageEn || err.message,
+      });
+    }
   }
 );
 
-// Get all rooms the current user is a member of
+// Get all rooms the current user is a member of (join_code strictly OWNER-only)
 router.get('/', requireAuth, (req: Request, res: Response) => {
-  const rooms = getUserRooms(req.user!.id);
+  const rooms = getUserRooms(req.user!.id).map((r: any) => {
+    if (r.role === 'OWNER') return r;
+    const { join_code: _omit, ...safeRoom } = r;
+    return safeRoom;
+  });
   res.json({ rooms });
 });
 
-// Switch active room
+// Switch active room (join_code strictly OWNER-only)
 router.post('/switch', requireAuth, (req: Request, res: Response) => {
   const schema = z.object({
     roomId: z.string().uuid(),
@@ -252,12 +295,16 @@ router.post('/switch', requireAuth, (req: Request, res: Response) => {
     return;
   }
 
-  const room = getRoomById(targetRoomId);
+  const rawRoom = getRoomById(targetRoomId);
+  const safeRoom =
+    rawRoom && member.role !== 'OWNER'
+      ? (({ join_code: _omit, ...rest }) => rest)(rawRoom as any)
+      : rawRoom;
   setSessionActiveRoom(req.session!.id, targetRoomId);
 
   res.json({
     success: true,
-    activeRoom: room,
+    activeRoom: safeRoom,
     activeMember: member,
   });
 });
@@ -419,13 +466,37 @@ router.post('/join', requireAuth, (req: Request, res: Response) => {
   }
 });
 
-// ======================== Owner-Only Room Management ========================
+// Cancel Pending Join Request (Applicant cancels own pending request)
+router.delete('/:roomId/cancel-request', requireAuth, (req: Request, res: Response) => {
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
+  try {
+    cancelJoinRequest(String(req.params.roomId), req.user!.id, {
+      email: req.user!.email,
+      name: req.user!.name,
+      ip: clientIp,
+    });
+    res.json({
+      success: true,
+      messageBn: 'যোগদানের আবেদনটি বাতিল করা হয়েছে।',
+      messageEn: 'Join request cancelled.',
+    });
+  } catch (err: any) {
+    res.status(400).json({
+      error: 'CANCEL_REQUEST_FAILED',
+      messageBn: err.message,
+      messageEn: err.message,
+    });
+  }
+});
 
-// Get members and pending requests for the room (Owner, Manager, Staff can view list; Owner has full management)
+// ======================== Owner / Manager Room Management ========================
+
+// Get members and pending requests for the room (Strictly OWNER and MANAGER only — Staff and Viewer denied!)
 router.get(
   '/:roomId/members',
   requireAuth,
   requireRoomMember,
+  requireRole(['OWNER', 'MANAGER']),
   (req: Request, res: Response) => {
     const members = getRoomMembers(req.room!.id);
     res.json({ members });
@@ -506,19 +577,163 @@ router.delete(
   }
 );
 
-// Approve Join Request (Owner only)
+// Suspend member (Owner only — cuts access & open sessions immediately)
+router.post(
+  '/:roomId/members/:userId/suspend',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  (req: Request, res: Response) => {
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
+    try {
+      suspendMember(req.room!.id, String(req.params.userId), {
+        userId: req.user!.id,
+        email: req.user!.email,
+        name: req.user!.name,
+        ip: clientIp,
+      });
+      res.json({
+        success: true,
+        messageBn: 'সদস্যের প্রবেশাধিকার তাৎক্ষণিকভাবে স্থগিত (Suspended) করা হয়েছে।',
+        messageEn: 'Member suspended and active sessions terminated immediately.',
+      });
+    } catch (err: any) {
+      res.status(400).json({
+        error: 'SUSPEND_MEMBER_FAILED',
+        messageBn: err.message,
+        messageEn: err.message,
+      });
+    }
+  }
+);
+
+// Transfer Room Ownership (Owner only, requires explicit confirmation, leaves previous Owner as Manager)
+router.post(
+  '/:roomId/transfer-ownership',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  (req: Request, res: Response) => {
+    const schema = z.object({
+      newOwnerUserId: z.string().min(1),
+      confirm: z.literal(true),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: 'CONFIRMATION_REQUIRED',
+        messageBn: 'মালিকানা হস্তান্তরের জন্য অনুমোদন নিশ্চিত করা আবশ্যক।',
+        messageEn: 'Explicit confirmation is required to transfer room ownership.',
+      });
+      return;
+    }
+
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
+    try {
+      transferRoomOwnership(req.room!.id, parsed.data.newOwnerUserId, {
+        userId: req.user!.id,
+        email: req.user!.email,
+        name: req.user!.name,
+        ip: clientIp,
+      });
+      res.json({
+        success: true,
+        messageBn: 'রুমের মালিকানা সফলভাবে হস্তান্তর করা হয়েছে।',
+        messageEn: 'Room ownership transferred successfully.',
+      });
+    } catch (err: any) {
+      res.status(400).json({
+        error: 'TRANSFER_OWNERSHIP_FAILED',
+        messageBn: err.message,
+        messageEn: err.message,
+      });
+    }
+  }
+);
+
+// Export All Room Data (Owner only — Privacy & Data Portability)
+router.get(
+  '/:roomId/export-data',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  (req: Request, res: Response) => {
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    if (!checkExportRateLimit(req.user!.id, clientIp)) {
+      res.status(429).json({
+        error: 'EXPORT_RATE_LIMITED',
+        messageBn: 'অতিরিক্ত এক্সপোর্ট অনুরোধ পাঠানো হয়েছে। একটু পর চেষ্টা করুন।',
+        messageEn: 'Too many export requests. Please wait a moment.',
+      });
+      return;
+    }
+    const payload = exportFullRoomData(req.room!.id, {
+      userId: req.user!.id,
+      email: req.user!.email,
+      name: req.user!.name,
+      ip: clientIp,
+    });
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="lilycc-room-backup-${req.room!.id.slice(0, 8)}.json"`
+    );
+    res.send(JSON.stringify(payload, null, 2));
+  }
+);
+
+// Soft-Delete Room (Owner only, with confirmation)
+router.delete(
+  '/:roomId',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  (req: Request, res: Response) => {
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
+    softDeleteRoom(req.room!.id, {
+      userId: req.user!.id,
+      email: req.user!.email,
+      name: req.user!.name,
+      ip: clientIp,
+    });
+    res.json({
+      success: true,
+      messageBn: 'রুমটি সফলভাবে মুছে ফেলা হয়েছে এবং সকল সেশন বিচ্ছিন্ন করা হয়েছে।',
+      messageEn: 'Room deleted and all active room sessions closed.',
+    });
+  }
+);
+
+// Approve Join Request (Owner only — OWNER role can NEVER be assigned here!)
 router.post(
   '/:roomId/requests/:userId/approve',
   requireAuth,
   requireRoomMember,
   requireRole(['OWNER']),
   (req: Request, res: Response) => {
+    if (req.body?.role === 'OWNER') {
+      res.status(400).json({
+        error: 'CANNOT_ASSIGN_OWNER',
+        messageBn: 'জয়েন রিকোয়েস্ট অনুমোদনের সময় কাউকে Owner পদবি দেওয়া যাবে না।',
+        messageEn: 'The Owner role cannot be assigned when approving a join request.',
+      });
+      return;
+    }
+
     const schema = z.object({
       role: z.enum(['STAFF', 'MANAGER', 'VIEWER']).optional().default('STAFF'),
     });
 
     const parsed = schema.safeParse(req.body);
-    const assignedRole = parsed.success ? parsed.data.role : 'STAFF';
+    if (!parsed.success) {
+      res.status(400).json({
+        error: 'INVALID_ROLE',
+        messageBn: 'অনুগ্রহ করে বৈধ পদবি (Manager / Staff / Viewer) নির্বাচন করুন।',
+        messageEn: 'Please select a valid role (Manager, Staff, or Viewer).',
+      });
+      return;
+    }
+    const assignedRole = parsed.data.role;
     const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
 
     try {
@@ -626,6 +841,7 @@ router.patch(
       logo_scale: z.number().min(0.5).max(2.0).optional(),
       default_language: z.enum(['bn', 'en']).optional(),
       join_approval_required: z.boolean().optional(),
+      allow_staff_costs: z.boolean().optional(),
       day_start_time: z.string().regex(/^\d{2}:\d{2}$/).optional(),
       day_end_time: z.string().regex(/^\d{2}:\d{2}$/).optional(),
       night_start_time: z.string().regex(/^\d{2}:\d{2}$/).optional(),
@@ -652,6 +868,7 @@ router.patch(
       delete payload.logo_scale;
       delete payload.default_language;
       delete payload.join_approval_required;
+      delete payload.allow_staff_costs;
     }
 
     const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
@@ -662,9 +879,14 @@ router.patch(
       ip: clientIp,
     });
 
+    const safeUpdated =
+      req.roomMember!.role === 'OWNER'
+        ? updated
+        : (({ join_code: _omit, ...rest }) => rest)(updated as any);
+
     res.json({
       success: true,
-      room: updated,
+      room: safeUpdated,
       messageBn: 'রুমের তথ্য ও স্লট সেটিংস সফলভাবে আপডেট করা হয়েছে।',
       messageEn: 'Room and slot settings updated successfully.',
     });
@@ -1621,6 +1843,27 @@ router.post(
 // ======================== Part 3: Expenses Routes (Owner & Manager Only) ========================
 
 router.get(
+  '/:roomId/payments',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER', 'MANAGER']),
+  (req: Request, res: Response) => {
+    const dateFrom = (req.query.dateFrom as string) || '';
+    const dateTo = (req.query.dateTo as string) || '';
+    const limit = parseInt((req.query.limit as string) || '100', 10);
+    const offset = parseInt((req.query.offset as string) || '0', 10);
+
+    const result = listRoomPayments(req.room!.id, {
+      dateFrom,
+      dateTo,
+      limit,
+      offset,
+    });
+    res.json(result);
+  }
+);
+
+router.get(
   '/:roomId/expenses',
   requireAuth,
   requireRoomMember,
@@ -1647,7 +1890,7 @@ router.post(
   '/:roomId/expenses',
   requireAuth,
   requireRoomMember,
-  requireRole(['OWNER', 'MANAGER']),
+  requireRole(['OWNER', 'MANAGER', 'STAFF']),
   sanitizeBody([
     'id',
     'room_id',
@@ -1661,6 +1904,16 @@ router.post(
     'created_at',
   ]),
   (req: Request, res: Response) => {
+    // Enforce "Allow Staff to add costs" setting on the server (default OFF)
+    if (req.roomMember!.role === 'STAFF' && Number((req.room as any)?.allow_staff_costs || 0) !== 1) {
+      res.status(403).json({
+        error: 'STAFF_COSTS_DISABLED',
+        messageBn: 'স্টাফ হিসেবে খরচ যোগ করার অনুমতি এই রুমে বন্ধ রয়েছে। শুধুমাত্র ওনার সেটিংস থেকে এটি চালু করতে পারেন।',
+        messageEn: 'Staff cannot add costs unless "Allow Staff to add costs" is enabled by the Owner.',
+      });
+      return;
+    }
+
     const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
     if (!checkCreateRateLimit(req.user!.id, clientIp)) {
       res.status(429).json({
@@ -2090,6 +2343,186 @@ router.delete(
       messageBn: 'সকল ডেমো ডেটা সফলভাবে মুছে ফেলা হয়েছে।',
       messageEn: 'All demo data removed successfully.',
     });
+  }
+);
+
+// ======================== Owner-Only Member Invites, PIN Reset, Devices & Ownership Transfer ========================
+
+router.post(
+  '/:roomId/invites',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  requireRecentReauth,
+  (req: Request, res: Response) => {
+    const schema = z.object({
+      memberName: z.string().min(2).max(100),
+      role: z.enum(['MANAGER', 'STAFF']),
+      idempotency_key: z.string().max(100).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: 'VALIDATION_FAILED',
+        messageBn: 'সদস্যের নাম এবং ম্যানেজার বা স্টাফ রোল নির্বাচন করুন।',
+        messageEn: 'Provide member name and MANAGER or STAFF role.',
+      });
+      return;
+    }
+
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    const idemKey = (req.headers['x-idempotency-key'] as string | undefined) || parsed.data.idempotency_key;
+    try {
+      const result = createMemberInvite(
+        req.room!.id,
+        { memberName: parsed.data.memberName, role: parsed.data.role, idempotencyKey: idemKey },
+        { userId: req.user!.id, email: req.user!.email, name: req.user!.name, ip: clientIp }
+      );
+      res.status(result.deduplicated ? 200 : 201).json({
+        success: true,
+        ...result,
+        messageBn: 'এক-ব্যবহারযোগ্য ইনভাইট কোড তৈরি হয়েছে (২৪ ঘণ্টা মেয়াদ)। এটি একবারই দেখানো হবে।',
+        messageEn: 'Single-use invite code created (expires in 24h). Shown once only.',
+      });
+    } catch (err: any) {
+      res.status(err.status || 400).json({
+        error: err.code || 'INVITE_FAILED',
+        messageBn: err.messageBn || err.message,
+        messageEn: err.messageEn || err.message,
+      });
+    }
+  }
+);
+
+router.get(
+  '/:roomId/invites',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  (req: Request, res: Response) => {
+    res.json({ invites: listRoomInvites(req.room!.id) });
+  }
+);
+
+router.delete(
+  '/:roomId/invites/:inviteId',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  requireRecentReauth,
+  (req: Request, res: Response) => {
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    revokeMemberInvite(req.room!.id, req.params.inviteId, {
+      userId: req.user!.id,
+      email: req.user!.email,
+      name: req.user!.name,
+      ip: clientIp,
+    });
+    res.json({ success: true });
+  }
+);
+
+router.post(
+  '/:roomId/members/:userId/reset-pin',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  requireRecentReauth,
+  (req: Request, res: Response) => {
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    try {
+      const result = resetMemberPin(req.room!.id, req.params.userId, {
+        userId: req.user!.id,
+        email: req.user!.email,
+        name: req.user!.name,
+        ip: clientIp,
+      });
+      res.json({
+        success: true,
+        ...result,
+        messageBn: 'পিন রিসেট করা হয়েছে ও পুরোনো সকল সেশন বাতিল করা হয়েছে। নতুন কোডটি সদস্যকে দিন।',
+        messageEn: 'PIN reset and all old sessions revoked. Share the new single-use code with the member.',
+      });
+    } catch (err: any) {
+      res.status(err.status || 400).json({
+        error: err.code || 'PIN_RESET_FAILED',
+        messageBn: err.messageBn || err.message,
+        messageEn: err.messageEn || err.message,
+      });
+    }
+  }
+);
+
+router.get(
+  '/:roomId/devices',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  (req: Request, res: Response) => {
+    res.json({ devices: listRoomDevices(req.room!.id) });
+  }
+);
+
+router.patch(
+  '/:roomId/devices/:deviceId',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  (req: Request, res: Response) => {
+    const schema = z.object({ status: z.enum(['APPROVED', 'REVOKED']) });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'INVALID_STATUS' });
+      return;
+    }
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    try {
+      const device = updateMemberDeviceStatus(req.room!.id, req.params.deviceId, parsed.data.status, {
+        userId: req.user!.id,
+        email: req.user!.email,
+        name: req.user!.name,
+        ip: clientIp,
+      });
+      res.json({ success: true, device });
+    } catch (err: any) {
+      res.status(err.status || 400).json({ error: 'DEVICE_UPDATE_FAILED', messageEn: err.message });
+    }
+  }
+);
+
+router.post(
+  '/:roomId/transfer-ownership',
+  requireAuth,
+  requireRoomMember,
+  requireRole(['OWNER']),
+  requireRecentReauth,
+  (req: Request, res: Response) => {
+    const schema = z.object({ targetUserId: z.string().uuid() });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'INVALID_TARGET_USER' });
+      return;
+    }
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    try {
+      transferRoomOwnershipAtomic(req.room!.id, parsed.data.targetUserId, {
+        userId: req.user!.id,
+        email: req.user!.email,
+        name: req.user!.name,
+        ip: clientIp,
+      });
+      res.json({
+        success: true,
+        messageBn: 'মালিকানা সফলভাবে হস্তান্তর করা হয়েছে।',
+        messageEn: 'Room ownership transferred successfully.',
+      });
+    } catch (err: any) {
+      res.status(err.status || 400).json({
+        error: 'TRANSFER_FAILED',
+        messageBn: err.messageBn || err.message,
+        messageEn: err.messageEn || err.message,
+      });
+    }
   }
 );
 

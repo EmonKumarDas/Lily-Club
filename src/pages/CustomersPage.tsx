@@ -16,7 +16,8 @@ import {
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from '../components/Toast.js';
 import { Modal } from '../components/Modal.js';
-import { LoadingSkeleton } from '../components/LoadingSkeleton.js';
+import { SectionLoader } from '../components/Loader.js';
+import { ActionButton, useUnsavedChanges } from '../components/ActionButton.js';
 import { EmptyState } from '../components/EmptyState.js';
 import { SlotBadge, type SlotType } from '../components/SlotBadge.js';
 import {
@@ -25,7 +26,7 @@ import {
   formatCurrency,
   formatNumberByLanguage,
 } from '../lib/dateUtils.js';
-import { apiRequest } from '../lib/api.js';
+import { apiRequest, generateIdempotencyKey } from '../lib/api.js';
 
 export interface CustomerItem {
   id: string;
@@ -50,6 +51,7 @@ export const CustomersPage: React.FC<{
   const [customers, setCustomers] = useState<CustomerItem[]>([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   const canEdit = activeMember?.role !== 'VIEWER';
   const canDelete = activeMember?.role === 'OWNER' || activeMember?.role === 'MANAGER';
@@ -64,7 +66,14 @@ export const CustomersPage: React.FC<{
   const [address, setAddress] = useState('');
   const [notes, setNotes] = useState('');
   const [duplicateSuggestion, setDuplicateSuggestion] = useState<CustomerItem | null>(null);
+  const [custIdemKey, setCustIdemKey] = useState('');
   const [saving, setSaving] = useState(false);
+
+  const isDirty =
+    modalOpen &&
+    !editingCustomer &&
+    (name.trim().length > 0 || phone.trim().length > 0 || address.trim().length > 0);
+  useUnsavedChanges(isDirty);
 
   // Customer Profile Modal
   const [profileOpen, setProfileOpen] = useState(false);
@@ -81,13 +90,16 @@ export const CustomersPage: React.FC<{
   const fetchCustomers = async () => {
     if (!activeRoom) return;
     setLoading(true);
+    setFetchError(null);
     try {
       const res = await apiRequest<{ customers: CustomerItem[]; total: number }>(
         `/api/rooms/${activeRoom.id}/customers?search=${encodeURIComponent(search)}`
       );
       setCustomers(res.customers || []);
     } catch (err: any) {
-      showError(err.messageBn || err.messageEn || 'Failed to load customers');
+      const msg = err.messageBn || err.messageEn || 'Failed to load customers';
+      setFetchError(msg);
+      showError(msg);
     } finally {
       setLoading(false);
     }
@@ -101,6 +113,7 @@ export const CustomersPage: React.FC<{
     setAddress('');
     setNotes('');
     setDuplicateSuggestion(null);
+    setCustIdemKey(generateIdempotencyKey('cust'));
     setModalOpen(true);
   };
 
@@ -138,6 +151,7 @@ export const CustomersPage: React.FC<{
       if (editingCustomer) {
         const res = await apiRequest(`/api/rooms/${activeRoom.id}/customers/${editingCustomer.id}`, {
           method: 'PATCH',
+          idempotencyKey: generateIdempotencyKey('cust-edit'),
           body: JSON.stringify({
             name: name.trim(),
             phone: phone.trim(),
@@ -150,6 +164,7 @@ export const CustomersPage: React.FC<{
       } else {
         const res = await apiRequest(`/api/rooms/${activeRoom.id}/customers`, {
           method: 'POST',
+          idempotencyKey: custIdemKey || generateIdempotencyKey('cust'),
           body: JSON.stringify({
             name: name.trim(),
             phone: phone.trim(),
@@ -218,13 +233,12 @@ export const CustomersPage: React.FC<{
         </div>
 
         {canEdit && (
-          <button
+          <ActionButton
             onClick={openAddModal}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs sm:text-sm font-bold shadow-md transition-all cursor-pointer self-start sm:self-auto"
+            icon={<Plus className="w-4 h-4" />}
           >
-            <Plus className="w-4 h-4" />
-            <span>{t('addCustomerBtn')}</span>
-          </button>
+            {t('addCustomerBtn')}
+          </ActionButton>
         )}
       </div>
 
@@ -240,14 +254,20 @@ export const CustomersPage: React.FC<{
               ? 'নাম বা ফোন নম্বর দিয়ে গ্রাহক খুঁজুন...'
               : 'Search customer by name or phone...'
           }
-          className="w-full pl-10 pr-4 py-2.5 rounded-2xl border border-stone-200 dark:border-stone-700 bg-white dark:bg-[#1E1920] text-xs sm:text-sm focus:outline-hidden focus:ring-2 focus:ring-[#582C4D]"
+          className="w-full pl-10 pr-4 py-2.5 rounded-2xl border border-stone-200 dark:border-stone-700 bg-white dark:bg-[#1E1920] text-xs sm:text-sm focus:outline-hidden focus:ring-2 focus:ring-[#4A2545]"
         />
       </div>
 
       {/* Customer List */}
-      {loading ? (
-        <LoadingSkeleton rows={4} />
-      ) : customers.length === 0 ? (
+      <SectionLoader
+        loading={loading}
+        error={fetchError}
+        onRetry={fetchCustomers}
+        language={language}
+        labelBn="গ্রাহকদের তালিকা লোড হচ্ছে..."
+        labelEn="Loading customers..."
+      >
+        {customers.length === 0 ? (
         <EmptyState
           icon={Users}
           title={language === 'bn' ? 'কোনো গ্রাহক পাওয়া যায়নি' : 'No customers found'}
@@ -325,20 +345,23 @@ export const CustomersPage: React.FC<{
                   )}
 
                   {canDelete && (c.booking_count || 0) === 0 && (
-                    <button
+                    <ActionButton
+                      variant="danger"
                       onClick={() => handleDeleteCustomer(c)}
-                      className="p-1.5 rounded-xl text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 cursor-pointer"
                       title={t('delete')}
+                      className="!p-1.5 !min-h-[36px] !rounded-xl"
+                      icon={<Trash2 className="w-3.5 h-3.5" />}
                     >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                      {''}
+                    </ActionButton>
                   )}
                 </div>
               </div>
             </div>
           ))}
         </div>
-      )}
+        )}
+      </SectionLoader>
 
       {/* Add / Edit Customer Modal */}
       <Modal
@@ -451,13 +474,13 @@ export const CustomersPage: React.FC<{
             >
               {t('cancel')}
             </button>
-            <button
+            <ActionButton
               type="submit"
-              disabled={saving}
-              className="px-5 py-2.5 text-xs font-bold text-white bg-[#582C4D] hover:bg-[#6C375F] rounded-xl shadow-md disabled:opacity-50 cursor-pointer"
+              loading={saving}
+              loadingLabel={t('saving')}
             >
-              {saving ? t('saving') : t('save')}
-            </button>
+              {t('save')}
+            </ActionButton>
           </div>
         </form>
       </Modal>
@@ -504,9 +527,12 @@ export const CustomersPage: React.FC<{
                 {formatNumberByLanguage(profileBookings.length, language)})
               </h4>
 
-              {loadingProfile ? (
-                <LoadingSkeleton rows={2} />
-              ) : profileBookings.length === 0 ? (
+              <SectionLoader
+                loading={loadingProfile}
+                language={language}
+                minHeightClass="min-h-[120px]"
+              >
+                {profileBookings.length === 0 ? (
                 <p className="text-xs text-stone-500 py-4 text-center">
                   {language === 'bn' ? 'এই গ্রাহকের কোনো বুকিং নেই।' : 'No bookings for this customer yet.'}
                 </p>
@@ -569,7 +595,8 @@ export const CustomersPage: React.FC<{
                     </tbody>
                   </table>
                 </div>
-              )}
+                )}
+              </SectionLoader>
             </div>
           </div>
         )}

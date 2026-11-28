@@ -15,7 +15,8 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from '../components/Toast.js';
-import { LoadingSkeleton } from '../components/LoadingSkeleton.js';
+import { SectionLoader } from '../components/Loader.js';
+import { ActionButton } from '../components/ActionButton.js';
 import { EmptyState } from '../components/EmptyState.js';
 import { DualDatePicker } from '../components/DualDatePicker.js';
 import { formatDualDate } from '../lib/dateUtils.js';
@@ -73,6 +74,7 @@ export const AuditLogPage: React.FC = () => {
   const [logs, setLogs] = useState<AuditLogItem[]>([]);
   const [members, setMembers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   // Filters: User, Action, Date Range
   const [userFilter, setUserFilter] = useState<string>('');
@@ -99,6 +101,7 @@ export const AuditLogPage: React.FC = () => {
   const fetchAuditLogs = async () => {
     if (!activeRoom) return;
     setLoading(true);
+    setFetchError(null);
     try {
       const params = new URLSearchParams({
         userId: userFilter,
@@ -112,7 +115,9 @@ export const AuditLogPage: React.FC = () => {
       );
       setLogs(res.logs || []);
     } catch (err: any) {
-      showError(err.messageBn || err.messageEn || 'Failed to load audit logs');
+      const msg = err.messageBn || err.messageEn || 'Failed to load audit logs';
+      setFetchError(msg);
+      showError(msg);
     } finally {
       setLoading(false);
     }
@@ -285,14 +290,14 @@ export const AuditLogPage: React.FC = () => {
           </p>
         </div>
 
-        <button
+        <ActionButton
+          variant="secondary"
           onClick={fetchAuditLogs}
-          disabled={loading}
-          className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-stone-700 dark:text-stone-200 bg-stone-100 dark:bg-stone-800 hover:bg-stone-200 dark:hover:bg-stone-700 rounded-xl transition-colors self-start sm:self-auto cursor-pointer"
+          loading={loading}
+          icon={<RefreshCw className="w-3.5 h-3.5" />}
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-          <span>{t('refresh')}</span>
-        </button>
+          {t('refresh')}
+        </ActionButton>
       </div>
 
       {/* Security Notice Pill */}
@@ -367,9 +372,15 @@ export const AuditLogPage: React.FC = () => {
       </div>
 
       {/* Logs Table / Cards (Strictly Append-Only: no edit, no delete buttons anywhere) */}
-      {loading ? (
-        <LoadingSkeleton rows={4} />
-      ) : logs.length === 0 ? (
+      <SectionLoader
+        loading={loading}
+        error={fetchError}
+        onRetry={fetchAuditLogs}
+        language={language}
+        labelBn="অডিট লগ লোড হচ্ছে..."
+        labelEn="Loading audit logs..."
+      >
+        {logs.length === 0 ? (
         <EmptyState
           icon={FileCheck2}
           title={t('noAuditLogs')}
@@ -427,7 +438,8 @@ export const AuditLogPage: React.FC = () => {
             );
           })}
         </div>
-      )}
+        )}
+      </SectionLoader>
     </div>
   );
 };

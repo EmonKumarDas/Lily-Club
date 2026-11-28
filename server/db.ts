@@ -4,6 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getConfig } from './config.js';
 import {
+  encryptSensitiveField,
+  decryptSensitiveField,
+  computePhoneBlindIndex,
+} from './fieldCrypto.js';
+import {
   formatDualDateFromYMD,
   formatTimeString12,
   formatCurrency,
@@ -383,6 +388,61 @@ function initSchema(db: DatabaseSync): void {
   if (!roomCols.includes('logo_scale')) {
     db.exec("ALTER TABLE rooms ADD COLUMN logo_scale REAL NOT NULL DEFAULT 1.0");
   }
+  if (!roomCols.includes('allow_staff_costs')) {
+    db.exec("ALTER TABLE rooms ADD COLUMN allow_staff_costs INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!roomCols.includes('is_deleted')) {
+    db.exec("ALTER TABLE rooms ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!roomCols.includes('deleted_at')) {
+    db.exec("ALTER TABLE rooms ADD COLUMN deleted_at INTEGER");
+  }
+
+  const hallCols = (db.prepare("PRAGMA table_info(halls)").all() as Array<{ name: string }>).map(c => c.name);
+  if (!hallCols.includes('is_deleted')) {
+    db.exec("ALTER TABLE halls ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!hallCols.includes('deleted_at')) {
+    db.exec("ALTER TABLE halls ADD COLUMN deleted_at INTEGER");
+  }
+
+  const custCols = (db.prepare("PRAGMA table_info(customers)").all() as Array<{ name: string }>).map(c => c.name);
+  if (!custCols.includes('phone_hash')) {
+    db.exec("ALTER TABLE customers ADD COLUMN phone_hash TEXT");
+  }
+  if (!custCols.includes('is_deleted')) {
+    db.exec("ALTER TABLE customers ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!custCols.includes('deleted_at')) {
+    db.exec("ALTER TABLE customers ADD COLUMN deleted_at INTEGER");
+  }
+
+  const bookingCols = (db.prepare("PRAGMA table_info(bookings)").all() as Array<{ name: string }>).map(c => c.name);
+  if (!bookingCols.includes('is_deleted')) {
+    db.exec("ALTER TABLE bookings ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!bookingCols.includes('deleted_at')) {
+    db.exec("ALTER TABLE bookings ADD COLUMN deleted_at INTEGER");
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS idempotency_records (
+      key TEXT PRIMARY KEY,
+      status_code INTEGER NOT NULL,
+      response_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS membership_status_log (
+      room_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      room_name TEXT NOT NULL,
+      role TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('REJECTED', 'REMOVED', 'SUSPENDED', 'ROOM_DELETED')),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (room_id, user_id)
+    );
+  `);
 }
 
 /**
@@ -623,6 +683,9 @@ export interface RoomRow {
   email?: string | null;
   primary_color?: string | null;
   logo_scale?: number;
+  allow_staff_costs?: number;
+  is_deleted?: number;
+  deleted_at?: number | null;
   created_by_user_id: string;
   created_at: number;
   updated_at: number;
@@ -630,6 +693,36 @@ export interface RoomRow {
 
 export type RoleType = 'OWNER' | 'MANAGER' | 'STAFF' | 'VIEWER';
 export type MemberStatus = 'ACTIVE' | 'PENDING' | 'REJECTED';
+export type ExtendedMemberNoticeStatus = 'REJECTED' | 'REMOVED' | 'SUSPENDED' | 'ROOM_DELETED';
+
+export interface MembershipNoticeRow {
+  room_id: string;
+  user_id: string;
+  room_name: string;
+  role: string;
+  status: ExtendedMemberNoticeStatus;
+  updated_at: number;
+}
+
+export function getIdempotentResponse(key: string): { statusCode: number; body: any } | null {
+  const db = getDb();
+  const row = db
+    .prepare('SELECT status_code, response_json FROM idempotency_records WHERE key = ?')
+    .get(key) as { status_code: number; response_json: string } | undefined;
+  if (!row) return null;
+  try {
+    return { statusCode: row.status_code, body: JSON.parse(row.response_json) };
+  } catch {
+    return null;
+  }
+}
+
+export function saveIdempotentResponse(key: string, statusCode: number, body: any): void {
+  const db = getDb();
+  db.prepare(
+    'INSERT OR IGNORE INTO idempotency_records (key, status_code, response_json, created_at) VALUES (?, ?, ?, ?)'
+  ).run(key, statusCode, JSON.stringify(body), Date.now());
+}
 
 export interface RoomMemberRow {
   id: string;
@@ -661,6 +754,38 @@ export function createRoom(
   const creatorId = data.createdByUserId || actor.userId;
   if (!creatorId) {
     throw new Error('Room creator user ID is required');
+  }
+
+  // Enforce optional ALLOWED_OWNER_EMAILS server-side check
+  const cfg = getConfig();
+  if (cfg.ALLOWED_OWNER_EMAILS.length > 0) {
+    const actorEmailNorm = (actor.email || '').trim().toLowerCase();
+    if (!cfg.ALLOWED_OWNER_EMAILS.includes(actorEmailNorm)) {
+      const err: any = new Error('This account is not permitted to create rooms.');
+      err.code = 'OWNER_EMAIL_NOT_ALLOWED';
+      err.status = 403;
+      err.messageBn = 'আপনার ইমেইল অ্যাকাউন্ট থেকে নতুন রুম তৈরির অনুমতি নেই।';
+      err.messageEn = 'Your Google account is not authorized to create new rooms.';
+      throw err;
+    }
+  }
+
+  // Enforce per-account room creation limit (default 3)
+  const ownedCountRow = db
+    .prepare(
+      `SELECT COUNT(*) as cnt
+       FROM rooms r
+       JOIN room_members rm ON rm.room_id = r.id
+       WHERE rm.user_id = ? AND rm.role = 'OWNER' AND rm.status = 'ACTIVE' AND COALESCE(r.is_deleted, 0) = 0`
+    )
+    .get(creatorId) as { cnt: number };
+  if (ownedCountRow.cnt >= cfg.MAX_ROOMS_PER_OWNER) {
+    const err: any = new Error(`Maximum ${cfg.MAX_ROOMS_PER_OWNER} rooms allowed per account.`);
+    err.code = 'MAX_ROOMS_REACHED';
+    err.status = 403;
+    err.messageBn = `একটি অ্যাকাউন্ট থেকে সর্বোচ্চ ${toBanglaDigits(cfg.MAX_ROOMS_PER_OWNER)}টি রুম তৈরি করা যাবে।`;
+    err.messageEn = `You can create at most ${cfg.MAX_ROOMS_PER_OWNER} active rooms per account.`;
+    throw err;
   }
 
   // Generate unique join code
@@ -711,13 +836,17 @@ export function createRoom(
 
 export function getRoomById(roomId: string): RoomRow | null {
   const db = getDb();
-  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(roomId) as RoomRow | undefined;
+  const room = db
+    .prepare('SELECT * FROM rooms WHERE id = ? AND COALESCE(is_deleted, 0) = 0')
+    .get(roomId) as RoomRow | undefined;
   return room || null;
 }
 
 export function getRoomByJoinCode(joinCode: string): RoomRow | null {
   const db = getDb();
-  const room = db.prepare('SELECT * FROM rooms WHERE join_code = ?').get(joinCode.trim().toUpperCase()) as RoomRow | undefined;
+  const room = db
+    .prepare('SELECT * FROM rooms WHERE join_code = ? AND COALESCE(is_deleted, 0) = 0')
+    .get(joinCode.trim().toUpperCase()) as RoomRow | undefined;
   return room || null;
 }
 
@@ -727,14 +856,27 @@ export function getUserRooms(userId: string): Array<RoomRow & { role: RoleType; 
     SELECT r.*, rm.role, rm.status as member_status
     FROM rooms r
     JOIN room_members rm ON r.id = rm.room_id
-    WHERE rm.user_id = ?
+    WHERE rm.user_id = ? AND COALESCE(r.is_deleted, 0) = 0
     ORDER BY rm.created_at DESC
   `).all(userId) as any[];
 
   return rows.map((r) => ({
     ...r,
     join_approval_required: Number(r.join_approval_required),
+    allow_staff_costs: Number(r.allow_staff_costs || 0),
   }));
+}
+
+export function getUserMembershipNotices(userId: string): MembershipNoticeRow[] {
+  const db = getDb();
+  return db
+    .prepare('SELECT * FROM membership_status_log WHERE user_id = ? ORDER BY updated_at DESC')
+    .all(userId) as unknown as MembershipNoticeRow[];
+}
+
+export function dismissMembershipNotice(roomId: string, userId: string): void {
+  const db = getDb();
+  db.prepare('DELETE FROM membership_status_log WHERE room_id = ? AND user_id = ?').run(roomId, userId);
 }
 
 export function getRoomMember(roomId: string, userId: string): RoomMemberRow | null {
@@ -802,6 +944,7 @@ export function updateRoomSettings(
     phone?: string;
     default_language?: 'bn' | 'en';
     join_approval_required?: boolean;
+    allow_staff_costs?: boolean;
     day_start_time?: string;
     day_end_time?: string;
     night_start_time?: string;
@@ -830,6 +973,10 @@ export function updateRoomSettings(
     data.join_approval_required !== undefined
       ? data.join_approval_required ? 1 : 0
       : current.join_approval_required;
+  const allowStaffCosts =
+    data.allow_staff_costs !== undefined
+      ? data.allow_staff_costs ? 1 : 0
+      : Number(current.allow_staff_costs ?? 0);
 
   const dayStart = data.day_start_time !== undefined ? data.day_start_time : (current.day_start_time || '08:00');
   const dayEnd = data.day_end_time !== undefined ? data.day_end_time : (current.day_end_time || '16:00');
@@ -844,12 +991,12 @@ export function updateRoomSettings(
   const now = Date.now();
   db.prepare(`
     UPDATE rooms 
-    SET name = ?, logo = ?, address = ?, phone = ?, email = ?, primary_color = ?, logo_scale = ?, default_language = ?, join_approval_required = ?,
+    SET name = ?, logo = ?, address = ?, phone = ?, email = ?, primary_color = ?, logo_scale = ?, default_language = ?, join_approval_required = ?, allow_staff_costs = ?,
         day_start_time = ?, day_end_time = ?, night_start_time = ?, night_end_time = ?,
         buffer_enabled = ?, buffer_minutes = ?, updated_at = ?
     WHERE id = ?
   `).run(
-    name, logo, address, phone, email, primaryColor, logoScale, defaultLang, approvalRequired,
+    name, logo, address, phone, email, primaryColor, logoScale, defaultLang, approvalRequired, allowStaffCosts,
     dayStart, dayEnd, nightStart, nightEnd,
     bufferEnabled, bufferMinutes, now, roomId
   );
@@ -866,6 +1013,7 @@ export function updateRoomSettings(
       phone,
       default_language: defaultLang,
       join_approval_required: Boolean(approvalRequired),
+      allow_staff_costs: Boolean(allowStaffCosts),
       day_start_time: dayStart,
       day_end_time: dayEnd,
       night_start_time: nightStart,
@@ -957,7 +1105,21 @@ export function removeMember(
     }
   }
 
+  const room = getRoomById(roomId);
+  const now = Date.now();
   db.prepare('DELETE FROM room_members WHERE room_id = ? AND user_id = ?').run(roomId, targetUserId);
+  // Immediately cut off open sessions in this room!
+  db.prepare('UPDATE sessions SET active_room_id = NULL WHERE user_id = ? AND active_room_id = ?').run(
+    targetUserId,
+    roomId
+  );
+  if (room) {
+    db.prepare(`
+      INSERT INTO membership_status_log (room_id, user_id, room_name, role, status, updated_at)
+      VALUES (?, ?, ?, ?, 'REMOVED', ?)
+      ON CONFLICT(room_id, user_id) DO UPDATE SET status = 'REMOVED', role = excluded.role, updated_at = excluded.updated_at
+    `).run(roomId, targetUserId, room.name, targetMember.role, now);
+  }
 
   addAuditLog({
     roomId,
@@ -975,12 +1137,275 @@ export function removeMember(
   });
 }
 
+export function suspendMember(
+  roomId: string,
+  targetUserId: string,
+  actor: { userId: string; email: string; name: string; ip?: string }
+): void {
+  const db = getDb();
+  const targetMember = getRoomMember(roomId, targetUserId);
+  if (!targetMember) throw new Error('Member not found in this room');
+  if (targetMember.role === 'OWNER') {
+    throw new Error('Safety violation: An Owner cannot be suspended.');
+  }
+
+  const room = getRoomById(roomId);
+  const now = Date.now();
+  db.prepare('DELETE FROM room_members WHERE room_id = ? AND user_id = ?').run(roomId, targetUserId);
+  db.prepare('UPDATE sessions SET active_room_id = NULL WHERE user_id = ? AND active_room_id = ?').run(
+    targetUserId,
+    roomId
+  );
+  if (room) {
+    db.prepare(`
+      INSERT INTO membership_status_log (room_id, user_id, room_name, role, status, updated_at)
+      VALUES (?, ?, ?, ?, 'SUSPENDED', ?)
+      ON CONFLICT(room_id, user_id) DO UPDATE SET status = 'SUSPENDED', role = excluded.role, updated_at = excluded.updated_at
+    `).run(roomId, targetUserId, room.name, targetMember.role, now);
+  }
+
+  addAuditLog({
+    roomId,
+    userId: actor.userId,
+    userEmail: actor.email,
+    userName: actor.name,
+    action: 'MEMBER_SUSPEND',
+    details: {
+      targetUserId,
+      targetUserEmail: targetMember.user_email,
+      targetUserName: targetMember.user_name,
+      role: targetMember.role,
+    },
+    ipAddress: actor.ip,
+  });
+}
+
+export function cancelJoinRequest(
+  roomId: string,
+  userId: string,
+  actor: { email: string; name: string; ip?: string }
+): void {
+  const db = getDb();
+  const existing = getRoomMember(roomId, userId);
+  if (!existing || existing.status !== 'PENDING') {
+    throw new Error('No pending join request found for this room.');
+  }
+  db.prepare('DELETE FROM room_members WHERE room_id = ? AND user_id = ? AND status = ?').run(
+    roomId,
+    userId,
+    'PENDING'
+  );
+  db.prepare('DELETE FROM membership_status_log WHERE room_id = ? AND user_id = ?').run(roomId, userId);
+  addAuditLog({
+    roomId,
+    userId,
+    userEmail: actor.email,
+    userName: actor.name,
+    action: 'JOIN_CANCEL',
+    details: { cancelledByApplicant: true },
+    ipAddress: actor.ip,
+  });
+}
+
+export function transferRoomOwnership(
+  roomId: string,
+  newOwnerUserId: string,
+  actor: { userId: string; email: string; name: string; ip?: string }
+): void {
+  const db = getDb();
+  if (newOwnerUserId === actor.userId) {
+    throw new Error('You are already the Owner of this room.');
+  }
+  const currentOwner = getRoomMember(roomId, actor.userId);
+  if (!currentOwner || currentOwner.role !== 'OWNER' || currentOwner.status !== 'ACTIVE') {
+    throw new Error('Only the active Owner can transfer ownership.');
+  }
+  const target = getRoomMember(roomId, newOwnerUserId);
+  if (!target || target.status !== 'ACTIVE') {
+    throw new Error('Target member must be an active member of this room.');
+  }
+
+  const now = Date.now();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('UPDATE room_members SET role = ?, updated_at = ? WHERE room_id = ? AND user_id = ?').run(
+      'OWNER',
+      now,
+      roomId,
+      newOwnerUserId
+    );
+    db.prepare('UPDATE room_members SET role = ?, updated_at = ? WHERE room_id = ? AND user_id = ?').run(
+      'MANAGER',
+      now,
+      roomId,
+      actor.userId
+    );
+    addAuditLog({
+      roomId,
+      userId: actor.userId,
+      userEmail: actor.email,
+      userName: actor.name,
+      action: 'OWNERSHIP_TRANSFER',
+      details: {
+        previousOwnerUserId: actor.userId,
+        previousOwnerEmail: actor.email,
+        newOwnerUserId,
+        newOwnerEmail: target.user_email,
+        newOwnerName: target.user_name,
+      },
+      ipAddress: actor.ip,
+    });
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {}
+    throw err;
+  }
+}
+
+export function softDeleteRoom(
+  roomId: string,
+  actor: { userId: string; email: string; name: string; ip?: string }
+): void {
+  const db = getDb();
+  const room = getRoomById(roomId);
+  if (!room) throw new Error('Room not found');
+
+  const members = getRoomMembers(roomId);
+  const now = Date.now();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('UPDATE rooms SET is_deleted = 1, deleted_at = ?, updated_at = ? WHERE id = ?').run(
+      now,
+      now,
+      roomId
+    );
+    db.prepare('UPDATE sessions SET active_room_id = NULL WHERE active_room_id = ?').run(roomId);
+    for (const m of members) {
+      db.prepare(`
+        INSERT INTO membership_status_log (room_id, user_id, room_name, role, status, updated_at)
+        VALUES (?, ?, ?, ?, 'ROOM_DELETED', ?)
+        ON CONFLICT(room_id, user_id) DO UPDATE SET status = 'ROOM_DELETED', updated_at = excluded.updated_at
+      `).run(roomId, m.user_id, room.name, m.role, now);
+    }
+    addAuditLog({
+      roomId,
+      userId: actor.userId,
+      userEmail: actor.email,
+      userName: actor.name,
+      action: 'ROOM_DELETE',
+      details: { roomName: room.name },
+      ipAddress: actor.ip,
+    });
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {}
+    throw err;
+  }
+}
+
+export function exportFullRoomData(
+  roomId: string,
+  actor: { userId: string; email: string; name: string; ip?: string }
+): Record<string, any> {
+  const room = getRoomById(roomId);
+  if (!room) throw new Error('Room not found');
+  const { join_code: _omit, ...safeRoom } = room;
+  const members = getRoomMembers(roomId);
+  const halls = getRoomHalls(roomId, true);
+  const { customers } = getRoomCustomers(roomId, '', 5000, 0);
+  const { bookings } = listRoomBookings(roomId, { limit: 200 });
+  const { payments } = listRoomPayments(roomId, { limit: 200 });
+  const { expenses } = listRoomExpenses(roomId, { limit: 200 });
+  const auditLogs = getRoomAuditLogs(roomId, 200, 0);
+
+  addAuditLog({
+    roomId,
+    userId: actor.userId,
+    userEmail: actor.email,
+    userName: actor.name,
+    action: 'ROOM_DATA_EXPORT',
+    details: { exportedAt: Date.now() },
+    ipAddress: actor.ip,
+  });
+
+  return {
+    exportedAt: new Date().toISOString(),
+    room: safeRoom,
+    members,
+    halls,
+    customers,
+    bookings,
+    payments,
+    expenses,
+    auditLogs,
+  };
+}
+
+export function deleteUserAccount(userId: string): void {
+  const db = getDb();
+  const user = getUserById(userId);
+  if (!user) throw new Error('User not found');
+
+  // Ensure no active room is left without an Owner!
+  const ownedRooms = db.prepare(`
+    SELECT r.id, r.name
+    FROM rooms r
+    JOIN room_members rm ON rm.room_id = r.id
+    WHERE rm.user_id = ? AND rm.role = 'OWNER' AND rm.status = 'ACTIVE' AND COALESCE(r.is_deleted, 0) = 0
+  `).all(userId) as Array<{ id: string; name: string }>;
+
+  for (const r of ownedRooms) {
+    const otherOwners = db.prepare(`
+      SELECT COUNT(*) as cnt
+      FROM room_members
+      WHERE room_id = ? AND role = 'OWNER' AND status = 'ACTIVE' AND user_id != ?
+    `).get(r.id, userId) as { cnt: number };
+    if (otherOwners.cnt === 0) {
+      const err: any = new Error(
+        `You are the sole Owner of "${r.name}". Please transfer ownership or delete the room before deleting your account.`
+      );
+      err.code = 'SOLE_OWNER_CANNOT_DELETE_ACCOUNT';
+      err.status = 400;
+      err.messageBn = `আপনি "${r.name}" রুমের একমাত্র Owner। অ্যাকাউন্ট মুছে ফেলার আগে অনুগ্রহ করে অন্য সদস্যকে মালিকানা হস্তান্তর করুন অথবা রুমটি মুছে ফেলুন।`;
+      err.messageEn = `You are the sole Owner of "${r.name}". Transfer ownership to another member or delete the room before deleting your account.`;
+      throw err;
+    }
+  }
+
+  const now = Date.now();
+  const anonId = crypto.randomUUID().slice(0, 12);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM room_members WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM membership_status_log WHERE user_id = ?').run(userId);
+    db.prepare(`
+      UPDATE users
+      SET google_id = ?, email = ?, name = 'Deleted Account', picture = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(`deleted-${anonId}`, `deleted-${anonId}@deleted.invalid`, now, userId);
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {}
+    throw err;
+  }
+}
+
 export function approveJoinRequest(
   roomId: string,
   targetUserId: string,
   assignedRole: RoleType = 'STAFF',
   actor: { userId: string; email: string; name: string; ip?: string }
 ): void {
+  if (assignedRole === 'OWNER') {
+    throw new Error('OWNER role cannot be assigned when approving a join request.');
+  }
   const db = getDb();
   const targetMember = getRoomMember(roomId, targetUserId);
   if (!targetMember) throw new Error('Join request not found');
@@ -991,6 +1416,10 @@ export function approveJoinRequest(
     SET status = 'ACTIVE', role = ?, updated_at = ?
     WHERE room_id = ? AND user_id = ?
   `).run(assignedRole, now, roomId, targetUserId);
+  db.prepare('DELETE FROM membership_status_log WHERE room_id = ? AND user_id = ?').run(
+    roomId,
+    targetUserId
+  );
 
   addAuditLog({
     roomId,
@@ -1017,7 +1446,20 @@ export function rejectJoinRequest(
   const targetMember = getRoomMember(roomId, targetUserId);
   if (!targetMember) throw new Error('Join request not found');
 
+  const room = getRoomById(roomId);
+  const now = Date.now();
   db.prepare('DELETE FROM room_members WHERE room_id = ? AND user_id = ?').run(roomId, targetUserId);
+  db.prepare('UPDATE sessions SET active_room_id = NULL WHERE user_id = ? AND active_room_id = ?').run(
+    targetUserId,
+    roomId
+  );
+  if (room) {
+    db.prepare(`
+      INSERT INTO membership_status_log (room_id, user_id, room_name, role, status, updated_at)
+      VALUES (?, ?, ?, 'VIEWER', 'REJECTED', ?)
+      ON CONFLICT(room_id, user_id) DO UPDATE SET status = 'REJECTED', updated_at = excluded.updated_at
+    `).run(roomId, targetUserId, room.name, now);
+  }
 
   addAuditLog({
     roomId,
@@ -1127,6 +1569,10 @@ export function addAuditLog(data: {
 export function maskSensitiveValue(key: string, val: any): any {
   if (typeof val !== 'string') return val;
   const lowerKey = key.toLowerCase();
+  // Never store Room ID / join_code in audit logs!
+  if (lowerKey.includes('joincode') || lowerKey === 'join_code') {
+    return '[REDACTED_ROOM_ID]';
+  }
   if (lowerKey.includes('phone') || lowerKey.includes('mobile')) {
     const clean = val.trim();
     if (clean.length <= 4) return '****';
@@ -1345,6 +1791,11 @@ function mapBookingRow(r: any): BookingRow {
     hold_expires_at: r.hold_expires_at ? Number(r.hold_expires_at) : null,
     cancelled_at: r.cancelled_at ? Number(r.cancelled_at) : null,
     is_demo: Number(r.is_demo || 0),
+    customer_phone: r.customer_phone !== undefined ? (decryptSensitiveField(r.customer_phone) ?? '') : undefined,
+    customer_alt_phone:
+      r.customer_alt_phone !== undefined ? decryptSensitiveField(r.customer_alt_phone) : undefined,
+    customer_address:
+      r.customer_address !== undefined ? decryptSensitiveField(r.customer_address) : undefined,
   };
 }
 
@@ -1442,7 +1893,7 @@ export function getHallById(roomId: string, hallId: string): HallRow | null {
   const row = db.prepare(`
     SELECT h.*, (SELECT COUNT(*) FROM bookings b WHERE b.hall_id = h.id) as booking_count
     FROM halls h
-    WHERE h.id = ? AND h.room_id = ?
+    WHERE h.id = ? AND h.room_id = ? AND COALESCE(h.is_deleted, 0) = 0
   `).get(hallId, roomId) as any;
   return row ? mapHallRow(row) : null;
 }
@@ -1452,7 +1903,7 @@ export function getRoomHalls(roomId: string, includeInactive = true): HallRow[] 
   let query = `
     SELECT h.*, (SELECT COUNT(*) FROM bookings b WHERE b.hall_id = h.id) as booking_count
     FROM halls h
-    WHERE h.room_id = ?
+    WHERE h.room_id = ? AND COALESCE(h.is_deleted, 0) = 0
   `;
   if (!includeInactive) {
     query += ' AND h.is_active = 1';
@@ -1560,20 +2011,38 @@ export function deleteOrDeactivateHall(
     return { deleted: false, deactivated: true };
   }
 
-  db.prepare('DELETE FROM halls WHERE id = ? AND room_id = ?').run(hallId, roomId);
+  // Soft-delete hall instead of hard delete to preserve auditability & point-in-time recovery
+  const now = Date.now();
+  db.prepare('UPDATE halls SET is_deleted = 1, is_active = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND room_id = ?').run(
+    now,
+    now,
+    hallId,
+    roomId
+  );
   addAuditLog({
     roomId,
     userId: actor.userId,
     userEmail: actor.email,
     userName: actor.name,
     action: 'HALL_DELETE',
-    details: { hallId, name: hall.name },
+    details: { hallId, name: hall.name, softDeleted: true },
     ipAddress: actor.ip,
   });
   return { deleted: true, deactivated: false };
 }
 
-// ======================== Customers Repository ========================
+// ======================== Customers Repository (AES-256-GCM Encrypted PII + Soft Delete) ========================
+
+function mapCustomerRow(r: any): CustomerRow {
+  return {
+    ...r,
+    phone: decryptSensitiveField(r.phone) || '',
+    alt_phone: r.alt_phone ? decryptSensitiveField(r.alt_phone) : null,
+    address: r.address ? decryptSensitiveField(r.address) : null,
+    is_demo: Number(r.is_demo || 0),
+    booking_count: r.booking_count !== undefined ? Number(r.booking_count || 0) : undefined,
+  };
+}
 
 export function normalizePhone(phone: string): string {
   return phone.replace(/[\s\-()]/g, '').trim();
@@ -1583,9 +2052,25 @@ export function findCustomerByPhone(roomId: string, phone: string): CustomerRow 
   const db = getDb();
   const norm = normalizePhone(phone);
   if (!norm) return null;
-  const rows = db.prepare('SELECT * FROM customers WHERE room_id = ?').all(roomId) as CustomerRow[];
-  const match = rows.find((c) => normalizePhone(c.phone) === norm || (c.alt_phone && normalizePhone(c.alt_phone) === norm));
-  return match || null;
+
+  // 1. Fast blind-index lookup
+  const blindHash = computePhoneBlindIndex(roomId, norm);
+  const byHash = db
+    .prepare('SELECT * FROM customers WHERE room_id = ? AND phone_hash = ? AND COALESCE(is_deleted, 0) = 0 LIMIT 1')
+    .get(roomId, blindHash) as any;
+  if (byHash) return mapCustomerRow(byHash);
+
+  // 2. Fallback scan across room customers (handles alt_phone & legacy pre-encryption rows)
+  const rows = db
+    .prepare('SELECT * FROM customers WHERE room_id = ? AND COALESCE(is_deleted, 0) = 0')
+    .all(roomId) as any[];
+  for (const raw of rows) {
+    const c = mapCustomerRow(raw);
+    if (normalizePhone(c.phone) === norm || (c.alt_phone && normalizePhone(c.alt_phone) === norm)) {
+      return c;
+    }
+  }
+  return null;
 }
 
 export function createCustomer(
@@ -1611,16 +2096,22 @@ export function createCustomer(
 
   const now = Date.now();
   const id = crypto.randomUUID();
+  const cleanPhone = data.phone.trim();
+  const cleanAltPhone = data.alt_phone ? data.alt_phone.trim() : null;
+  const cleanAddress = data.address ? data.address.trim() : null;
+  const phoneHash = computePhoneBlindIndex(roomId, normalizePhone(cleanPhone));
+
   db.prepare(`
-    INSERT INTO customers (id, room_id, name, phone, alt_phone, address, notes, is_demo, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO customers (id, room_id, name, phone, phone_hash, alt_phone, address, notes, is_demo, is_deleted, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
   `).run(
     id,
     roomId,
     data.name.trim(),
-    data.phone.trim(),
-    data.alt_phone ? data.alt_phone.trim() : null,
-    data.address ? data.address.trim() : null,
+    encryptSensitiveField(cleanPhone),
+    phoneHash,
+    encryptSensitiveField(cleanAltPhone),
+    encryptSensitiveField(cleanAddress),
     data.notes ? data.notes.trim() : null,
     data.is_demo ? 1 : 0,
     now,
@@ -1633,7 +2124,7 @@ export function createCustomer(
     userEmail: actor.email,
     userName: actor.name,
     action: 'CUSTOMER_CREATE',
-    details: { customerId: id, name: data.name, phone: data.phone },
+    details: { customerId: id, name: data.name, phone: cleanPhone },
     ipAddress: actor.ip,
   });
 
@@ -1645,43 +2136,35 @@ export function getCustomerById(roomId: string, customerId: string): CustomerRow
   const row = db.prepare(`
     SELECT c.*, (SELECT COUNT(*) FROM bookings b WHERE b.customer_id = c.id) as booking_count
     FROM customers c
-    WHERE c.id = ? AND c.room_id = ?
+    WHERE c.id = ? AND c.room_id = ? AND COALESCE(c.is_deleted, 0) = 0
   `).get(customerId, roomId) as any;
   if (!row) return null;
-  return {
-    ...row,
-    is_demo: Number(row.is_demo || 0),
-    booking_count: Number(row.booking_count || 0),
-  };
+  return mapCustomerRow(row);
 }
 
 export function getRoomCustomers(roomId: string, search?: string, limit = 100, offset = 0): { customers: CustomerRow[]; total: number } {
   const db = getDb();
-  let where = 'WHERE c.room_id = ?';
-  const params: any[] = [roomId];
-
-  if (search && search.trim()) {
-    const q = `%${search.trim()}%`;
-    where += ' AND (c.name LIKE ? OR c.phone LIKE ? OR c.alt_phone LIKE ?)';
-    params.push(q, q, q);
-  }
-
-  const totalRow = db.prepare(`SELECT COUNT(*) as cnt FROM customers c ${where}`).get(...params) as { cnt: number };
-  const rows = db.prepare(`
+  const allRows = db.prepare(`
     SELECT c.*, (SELECT COUNT(*) FROM bookings b WHERE b.customer_id = c.id) as booking_count
     FROM customers c
-    ${where}
+    WHERE c.room_id = ? AND COALESCE(c.is_deleted, 0) = 0
     ORDER BY c.created_at DESC
-    LIMIT ? OFFSET ?
-  `).all(...params, limit, offset) as any[];
+  `).all(roomId) as any[];
+
+  let mapped = allRows.map(mapCustomerRow);
+  if (search && search.trim()) {
+    const q = search.trim().toLowerCase();
+    mapped = mapped.filter(
+      (c) =>
+        c.name.toLowerCase().includes(q) ||
+        c.phone.toLowerCase().includes(q) ||
+        (c.alt_phone && c.alt_phone.toLowerCase().includes(q))
+    );
+  }
 
   return {
-    total: totalRow.cnt,
-    customers: rows.map((r) => ({
-      ...r,
-      is_demo: Number(r.is_demo || 0),
-      booking_count: Number(r.booking_count || 0),
-    })),
+    total: mapped.length,
+    customers: mapped.slice(offset, offset + limit),
   };
 }
 
@@ -1715,12 +2198,23 @@ export function updateCustomer(
   const altPhone = data.alt_phone !== undefined ? (data.alt_phone ? data.alt_phone.trim() : null) : current.alt_phone;
   const address = data.address !== undefined ? (data.address ? data.address.trim() : null) : current.address;
   const notes = data.notes !== undefined ? (data.notes ? data.notes.trim() : null) : current.notes;
+  const phoneHash = computePhoneBlindIndex(roomId, normalizePhone(phone));
 
   db.prepare(`
     UPDATE customers
-    SET name = ?, phone = ?, alt_phone = ?, address = ?, notes = ?, updated_at = ?
+    SET name = ?, phone = ?, phone_hash = ?, alt_phone = ?, address = ?, notes = ?, updated_at = ?
     WHERE id = ? AND room_id = ?
-  `).run(name, phone, altPhone, address, notes, Date.now(), customerId, roomId);
+  `).run(
+    name,
+    encryptSensitiveField(phone),
+    phoneHash,
+    encryptSensitiveField(altPhone),
+    encryptSensitiveField(address),
+    notes,
+    Date.now(),
+    customerId,
+    roomId
+  );
 
   addAuditLog({
     roomId,
@@ -1749,14 +2243,20 @@ export function deleteCustomer(
     throw new Error('CUSTOMER_HAS_BOOKINGS');
   }
 
-  db.prepare('DELETE FROM customers WHERE id = ? AND room_id = ?').run(customerId, roomId);
+  const now = Date.now();
+  db.prepare('UPDATE customers SET is_deleted = 1, deleted_at = ?, updated_at = ? WHERE id = ? AND room_id = ?').run(
+    now,
+    now,
+    customerId,
+    roomId
+  );
   addAuditLog({
     roomId,
     userId: actor.userId,
     userEmail: actor.email,
     userName: actor.name,
     action: 'CUSTOMER_DELETE',
-    details: { customerId, name: customer.name, phone: customer.phone },
+    details: { customerId, name: customer.name, phone: customer.phone, softDeleted: true },
     ipAddress: actor.ip,
   });
 }
@@ -3128,9 +3628,29 @@ export function listRoomBookings(
   const params: any[] = [roomId];
 
   if (filter.search && filter.search.trim()) {
-    const q = `%${filter.search.trim()}%`;
-    where += ' AND (b.booking_number LIKE ? OR c.name LIKE ? OR c.phone LIKE ? OR c.alt_phone LIKE ?)';
-    params.push(q, q, q, q);
+    const rawSearch = filter.search.trim();
+    const q = `%${rawSearch}%`;
+    const phoneHashCandidate = computePhoneBlindIndex(roomId, normalizePhone(rawSearch));
+    // Match decrypted customer IDs when searching by partial phone digits
+    const matchingCustIds = (
+      db.prepare('SELECT id, phone, alt_phone FROM customers WHERE room_id = ?').all(roomId) as any[]
+    )
+      .filter((c) => {
+        const p1 = (decryptSensitiveField(c.phone) || '').toLowerCase();
+        const p2 = (decryptSensitiveField(c.alt_phone) || '').toLowerCase();
+        const needle = rawSearch.toLowerCase();
+        return p1.includes(needle) || p2.includes(needle);
+      })
+      .map((c) => c.id);
+
+    if (matchingCustIds.length > 0) {
+      const placeholders = matchingCustIds.map(() => '?').join(',');
+      where += ` AND (b.booking_number LIKE ? OR c.name LIKE ? OR c.phone_hash = ? OR b.customer_id IN (${placeholders}))`;
+      params.push(q, q, phoneHashCandidate, ...matchingCustIds);
+    } else {
+      where += ' AND (b.booking_number LIKE ? OR c.name LIKE ? OR c.phone_hash = ?)';
+      params.push(q, q, phoneHashCandidate);
+    }
   }
   if (filter.status) {
     where += ' AND b.status = ?';
@@ -3711,6 +4231,7 @@ function mapPaymentRow(r: any): PaymentRow {
   return {
     ...r,
     amount: roundMoney(Number(r.amount)),
+    reference_number: r.reference_number ? decryptSensitiveField(r.reference_number) : null,
     is_reversed: Number(r.is_reversed || 0),
     is_demo: Number(r.is_demo || 0),
   };
@@ -3905,7 +4426,7 @@ export function createPayment(
       signedAmount,
       data.payment_date,
       data.method,
-      data.reference_number ? data.reference_number.trim() : null,
+      data.reference_number ? encryptSensitiveField(data.reference_number.trim()) : null,
       actor.userId,
       actor.name,
       data.note ? data.note.trim() : null,
@@ -4205,6 +4726,121 @@ export function listRoomExpenses(
     expenses: rows.map(mapExpenseRow),
     total: statRow.cnt,
     netTotalAmount: roundMoney(statRow.net_total),
+  };
+}
+
+export function listRoomPayments(
+  roomId: string,
+  filter: {
+    dateFrom?: string;
+    dateTo?: string;
+    limit?: number;
+    offset?: number;
+  } = {}
+): { payments: any[]; total: number; netTotalAmount: number } {
+  const db = getDb();
+  let where = 'WHERE p.room_id = ?';
+  const params: any[] = [roomId];
+
+  if (filter.dateFrom) {
+    where += ' AND b.event_date >= ?';
+    params.push(filter.dateFrom);
+  }
+  if (filter.dateTo) {
+    where += ' AND b.event_date <= ?';
+    params.push(filter.dateTo);
+  }
+
+  const limit = Math.min(200, Math.max(1, filter.limit || 100));
+  const offset = Math.max(0, filter.offset || 0);
+
+  const rows = db.prepare(`
+    SELECT p.*,
+           b.booking_number, b.event_date, b.slot, b.event_type, b.status as booking_status,
+           c.name as customer_name, c.phone as customer_phone, c.address as customer_address,
+           h.name as hall_name
+    FROM payments p
+    JOIN bookings b ON p.booking_id = b.id
+    JOIN customers c ON b.customer_id = c.id
+    JOIN halls h ON b.hall_id = h.id
+    ${where}
+    ORDER BY p.payment_date DESC, p.created_at DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, limit, offset) as any[];
+
+  const mappedPayments = rows.map((r) => ({
+    ...mapPaymentRow(r),
+    booking_number: r.booking_number,
+    event_date: r.event_date,
+    slot: r.slot,
+    event_type: r.event_type,
+    booking_status: r.booking_status,
+    customer_name: r.customer_name,
+    customer_phone: decryptSensitiveField(r.customer_phone) || '',
+    customer_address: decryptSensitiveField(r.customer_address) || '',
+    hall_name: r.hall_name,
+  }));
+
+  // Also include legacy/seed bookings in the range that have advance_amount > 0 but no payments row (matches generateRoomReport)
+  let legacyWhere = 'WHERE b.room_id = ? AND b.advance_amount > 0 AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.booking_id = b.id)';
+  const legacyParams: any[] = [roomId];
+  if (filter.dateFrom) {
+    legacyWhere += ' AND b.event_date >= ?';
+    legacyParams.push(filter.dateFrom);
+  }
+  if (filter.dateTo) {
+    legacyWhere += ' AND b.event_date <= ?';
+    legacyParams.push(filter.dateTo);
+  }
+
+  const legacyRows = db.prepare(`
+    SELECT b.id as booking_id, b.booking_number, b.event_date, b.slot, b.event_type, b.status as booking_status,
+           b.advance_amount, b.created_at,
+           c.name as customer_name, c.phone as customer_phone, c.address as customer_address,
+           h.name as hall_name
+    FROM bookings b
+    JOIN customers c ON b.customer_id = c.id
+    JOIN halls h ON b.hall_id = h.id
+    ${legacyWhere}
+    ORDER BY b.event_date DESC
+  `).all(...legacyParams) as any[];
+
+  for (const lr of legacyRows) {
+    mappedPayments.push({
+      id: `legacy-adv-${lr.booking_id}`,
+      room_id: roomId,
+      booking_id: lr.booking_id,
+      receipt_number: `ADV-${lr.booking_number}`,
+      payment_type: 'ADVANCE',
+      amount: roundMoney(lr.advance_amount),
+      payment_date: lr.event_date,
+      method: 'CASH',
+      reference_number: null,
+      received_by_user_id: '',
+      received_by_name: '',
+      note: 'Advance at booking',
+      reverses_payment_id: null,
+      is_reversed: false,
+      is_demo: false,
+      created_at: lr.created_at,
+      booking_number: lr.booking_number,
+      event_date: lr.event_date,
+      slot: lr.slot,
+      event_type: lr.event_type,
+      booking_status: lr.booking_status,
+      customer_name: lr.customer_name,
+      customer_phone: decryptSensitiveField(lr.customer_phone) || '',
+      customer_address: decryptSensitiveField(lr.customer_address) || '',
+      hall_name: lr.hall_name,
+    });
+  }
+
+  const netTotalAmount = roundMoney(mappedPayments.reduce((sum, p) => sum + Number(p.amount || 0), 0));
+
+  return {
+    payments: mappedPayments,
+    total: mappedPayments.length,
+    netTotalAmount,
   };
 }
 
@@ -5275,8 +5911,8 @@ export function generateRoomDashboard(
     },
   };
 
-  // 8. Recent activity: last 10 actions from audit log (Owner and Manager only!)
-  const recentActivity = canSeeMoney ? getRoomAuditLogs(roomId, 10, 0) : [];
+  // 8. Recent activity: last 10 actions from audit log (Strictly Owner only!)
+  const recentActivity = role === 'OWNER' ? getRoomAuditLogs(roomId, 10, 0) : [];
 
   return {
     todayYMD,

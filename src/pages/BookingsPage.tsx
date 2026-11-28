@@ -15,7 +15,8 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from '../components/Toast.js';
-import { LoadingSkeleton } from '../components/LoadingSkeleton.js';
+import { SectionLoader } from '../components/Loader.js';
+import { ActionButton } from '../components/ActionButton.js';
 import { EmptyState } from '../components/EmptyState.js';
 import { SlotBadge, type SlotType } from '../components/SlotBadge.js';
 import {
@@ -31,7 +32,7 @@ import {
   getNextDayYMD,
   isNightCrossingMidnight,
 } from '../lib/dateUtils.js';
-import { apiRequest } from '../lib/api.js';
+import { apiRequest, generateIdempotencyKey } from '../lib/api.js';
 import type { HallItem } from './HallsPage.js';
 
 export interface BookingsExternalFilter {
@@ -67,6 +68,7 @@ export const BookingsPage: React.FC<BookingsPageProps> = ({
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   // Filters
   const [search, setSearch] = useState('');
@@ -143,6 +145,7 @@ export const BookingsPage: React.FC<BookingsPageProps> = ({
   const fetchBookings = async () => {
     if (!activeRoom) return;
     setLoading(true);
+    setFetchError(null);
     try {
       const params = new URLSearchParams({
         search,
@@ -167,7 +170,12 @@ export const BookingsPage: React.FC<BookingsPageProps> = ({
       setTotal(res.total || 0);
       setTotalPages(res.totalPages || 1);
     } catch (err: any) {
-      showError(language === 'bn' ? err.messageBn : err.messageEn);
+      const msg =
+        language === 'bn'
+          ? err.messageBn || 'বুকিং তালিকা লোড করতে সমস্যা হয়েছে।'
+          : err.messageEn || 'Failed to load bookings.';
+      setFetchError(msg);
+      showError(msg);
     } finally {
       setLoading(false);
     }
@@ -179,6 +187,7 @@ export const BookingsPage: React.FC<BookingsPageProps> = ({
     try {
       const res = await apiRequest(`/api/rooms/${activeRoom.id}/demo-data/seed`, {
         method: 'POST',
+        idempotencyKey: generateIdempotencyKey('seed-demo'),
       });
       showSuccess(language === 'bn' ? res.messageBn : res.messageEn);
       const hRes = await apiRequest<{ halls: HallItem[] }>(`/api/rooms/${activeRoom.id}/halls`);
@@ -197,6 +206,7 @@ export const BookingsPage: React.FC<BookingsPageProps> = ({
     try {
       const res = await apiRequest(`/api/rooms/${activeRoom.id}/demo-data`, {
         method: 'DELETE',
+        idempotencyKey: generateIdempotencyKey('clear-demo'),
       });
       showSuccess(language === 'bn' ? res.messageBn : res.messageEn);
       const hRes = await apiRequest<{ halls: HallItem[] }>(`/api/rooms/${activeRoom.id}/halls`);
@@ -275,39 +285,38 @@ export const BookingsPage: React.FC<BookingsPageProps> = ({
         <div className="flex flex-wrap items-center gap-2">
           {canManageDemo && (
             <>
-              <button
+              <ActionButton
+                variant="secondary"
                 onClick={handleSeedDemoData}
-                disabled={seedingDemo}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-amber-100 hover:bg-amber-200 dark:bg-amber-950/60 dark:hover:bg-amber-900/70 text-amber-900 dark:text-amber-200 border border-amber-300 dark:border-amber-800 text-xs font-bold transition-colors cursor-pointer"
+                loading={seedingDemo}
+                icon={<Sparkles className="w-3.5 h-3.5" />}
               >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>{t('seedDemoBtn')}</span>
-              </button>
+                {t('seedDemoBtn')}
+              </ActionButton>
 
               {hasDemoBookings && (
-                <button
+                <ActionButton
+                  variant="danger"
                   onClick={handleClearDemoData}
-                  disabled={seedingDemo}
-                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 text-xs font-bold transition-colors cursor-pointer"
+                  loading={seedingDemo}
+                  icon={<Trash2 className="w-3.5 h-3.5" />}
                 >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>{t('clearDemoBtn')}</span>
-                </button>
+                  {t('clearDemoBtn')}
+                </ActionButton>
               )}
             </>
           )}
 
           {canCreate && (
-            <button
+            <ActionButton
               onClick={() => {
                 setWizardInitialData(null);
                 setWizardOpen(true);
               }}
-              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs sm:text-sm font-bold shadow-md transition-all cursor-pointer"
+              icon={<Plus className="w-4 h-4" />}
             >
-              <Plus className="w-4 h-4" />
-              <span>{t('newBookingBtn')}</span>
-            </button>
+              {t('newBookingBtn')}
+            </ActionButton>
           )}
         </div>
       </div>
@@ -451,9 +460,15 @@ export const BookingsPage: React.FC<BookingsPageProps> = ({
       </div>
 
       {/* Bookings List: Table on Desktop, Card View on Mobile */}
-      {loading ? (
-        <LoadingSkeleton rows={5} />
-      ) : bookings.length === 0 ? (
+      <SectionLoader
+        loading={loading}
+        error={fetchError}
+        onRetry={fetchBookings}
+        language={language}
+        labelBn="বুকিং তালিকা লোড হচ্ছে..."
+        labelEn="Loading bookings..."
+      >
+        {bookings.length === 0 ? (
         <EmptyState
           icon={CalendarDays}
           title={language === 'bn' ? 'কোনো বুকিং পাওয়া যায়নি' : 'No bookings found'}
@@ -653,7 +668,8 @@ export const BookingsPage: React.FC<BookingsPageProps> = ({
             </div>
           )}
         </>
-      )}
+        )}
+      </SectionLoader>
 
       {/* Multi-Step Booking Wizard Modal */}
       <BookingWizardModal

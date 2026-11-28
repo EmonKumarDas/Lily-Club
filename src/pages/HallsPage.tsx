@@ -14,11 +14,12 @@ import {
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from '../components/Toast.js';
 import { Modal } from '../components/Modal.js';
-import { LoadingSkeleton } from '../components/LoadingSkeleton.js';
+import { SectionLoader } from '../components/Loader.js';
+import { ActionButton, useUnsavedChanges } from '../components/ActionButton.js';
 import { EmptyState } from '../components/EmptyState.js';
 import { SlotBadge } from '../components/SlotBadge.js';
 import { formatCurrency, formatNumberByLanguage, formatDualDate } from '../lib/dateUtils.js';
-import { apiRequest } from '../lib/api.js';
+import { apiRequest, generateIdempotencyKey } from '../lib/api.js';
 
 export interface HallItem {
   id: string;
@@ -43,6 +44,7 @@ export const HallsPage: React.FC = () => {
 
   const [halls, setHalls] = useState<HallItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   const canManage = activeMember?.role === 'OWNER' || activeMember?.role === 'MANAGER';
 
@@ -57,7 +59,10 @@ export const HallsPage: React.FC = () => {
   const [facilitiesText, setFacilitiesText] = useState('');
   const [photoUrl, setPhotoUrl] = useState('');
   const [isActive, setIsActive] = useState(true);
+  const [hallIdemKey, setHallIdemKey] = useState('');
   const [saving, setSaving] = useState(false);
+
+  useUnsavedChanges(modalOpen && !editingHall && name.trim().length > 0);
 
   useEffect(() => {
     if (activeRoom) {
@@ -68,11 +73,14 @@ export const HallsPage: React.FC = () => {
   const fetchHalls = async () => {
     if (!activeRoom) return;
     setLoading(true);
+    setFetchError(null);
     try {
       const res = await apiRequest<{ halls: HallItem[] }>(`/api/rooms/${activeRoom.id}/halls`);
       setHalls(res.halls || []);
     } catch (err: any) {
-      showError(err.messageBn || err.messageEn || 'Failed to load halls');
+      const msg = err.messageBn || err.messageEn || 'Failed to load halls';
+      setFetchError(msg);
+      showError(msg);
     } finally {
       setLoading(false);
     }
@@ -88,6 +96,7 @@ export const HallsPage: React.FC = () => {
     setFacilitiesText('Central AC / কেন্দ্রীয় এসি, Bridal Stage / স্টেজ, Generator / জেনারেটর');
     setPhotoUrl('');
     setIsActive(true);
+    setHallIdemKey(generateIdempotencyKey('hall'));
     setModalOpen(true);
   };
 
@@ -119,6 +128,7 @@ export const HallsPage: React.FC = () => {
       if (editingHall) {
         const res = await apiRequest(`/api/rooms/${activeRoom.id}/halls/${editingHall.id}`, {
           method: 'PATCH',
+          idempotencyKey: generateIdempotencyKey('hall-edit'),
           body: JSON.stringify({
             name: name.trim(),
             capacity: Number(capacity),
@@ -134,6 +144,7 @@ export const HallsPage: React.FC = () => {
       } else {
         const res = await apiRequest(`/api/rooms/${activeRoom.id}/halls`, {
           method: 'POST',
+          idempotencyKey: hallIdemKey || generateIdempotencyKey('hall'),
           body: JSON.stringify({
             name: name.trim(),
             capacity: Number(capacity),
@@ -198,20 +209,25 @@ export const HallsPage: React.FC = () => {
         </div>
 
         {canManage && (
-          <button
+          <ActionButton
             onClick={openAddModal}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs sm:text-sm font-bold shadow-md transition-all cursor-pointer self-start sm:self-auto"
+            icon={<Plus className="w-4 h-4" />}
           >
-            <Plus className="w-4 h-4" />
-            <span>{t('addHallBtn')}</span>
-          </button>
+            {t('addHallBtn')}
+          </ActionButton>
         )}
       </div>
 
       {/* Content */}
-      {loading ? (
-        <LoadingSkeleton rows={4} />
-      ) : halls.length === 0 ? (
+      <SectionLoader
+        loading={loading}
+        error={fetchError}
+        onRetry={fetchHalls}
+        language={language}
+        labelBn="হলের তথ্য লোড হচ্ছে..."
+        labelEn="Loading halls..."
+      >
+        {halls.length === 0 ? (
         <EmptyState
           icon={Building2}
           title={language === 'bn' ? 'কোনো হল এখনও যুক্ত করা হয়নি' : 'No halls added yet'}
@@ -343,34 +359,31 @@ export const HallsPage: React.FC = () => {
                         <span>{language === 'bn' ? 'সম্পাদনা' : 'Edit'}</span>
                       </button>
 
-                      <button
+                      <ActionButton
+                        variant="ghost"
                         onClick={() => handleToggleActive(hall)}
-                        className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-xl font-bold transition-colors cursor-pointer ${
-                          hall.is_active === 1
-                            ? 'bg-amber-100/80 text-amber-800 hover:bg-amber-200 dark:bg-amber-950/50 dark:text-amber-300'
-                            : 'bg-emerald-100/80 text-emerald-800 hover:bg-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300'
-                        }`}
+                        icon={<Power className="w-3.5 h-3.5" />}
+                        className="!px-3 !py-1.5 !min-h-[36px] !text-xs"
                       >
-                        <Power className="w-3.5 h-3.5" />
-                        <span>
-                          {hall.is_active === 1
-                            ? language === 'bn'
-                              ? 'নিষ্ক্রিয় করুন'
-                              : 'Deactivate'
-                            : language === 'bn'
-                            ? 'সক্রিয় করুন'
-                            : 'Activate'}
-                        </span>
-                      </button>
+                        {hall.is_active === 1
+                          ? language === 'bn'
+                            ? 'নিষ্ক্রিয় করুন'
+                            : 'Deactivate'
+                          : language === 'bn'
+                          ? 'সক্রিয় করুন'
+                          : 'Activate'}
+                      </ActionButton>
 
                       {(hall.booking_count || 0) === 0 && (
-                        <button
+                        <ActionButton
+                          variant="danger"
                           onClick={() => handleDeleteOrDeactivate(hall)}
-                          className="p-1.5 rounded-xl text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
                           title={t('delete')}
+                          className="!p-1.5 !min-h-[36px] !rounded-xl"
+                          icon={<Trash2 className="w-4 h-4" />}
                         >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                          {''}
+                        </ActionButton>
                       )}
                     </div>
                   )}
@@ -379,7 +392,8 @@ export const HallsPage: React.FC = () => {
             </div>
           ))}
         </div>
-      )}
+        )}
+      </SectionLoader>
 
       {/* Add / Edit Hall Modal */}
       <Modal
@@ -509,13 +523,13 @@ export const HallsPage: React.FC = () => {
             >
               {t('cancel')}
             </button>
-            <button
+            <ActionButton
               type="submit"
-              disabled={saving}
-              className="px-5 py-2.5 text-xs font-bold text-white bg-[#582C4D] hover:bg-[#6C375F] rounded-xl shadow-md disabled:opacity-50 cursor-pointer"
+              loading={saving}
+              loadingLabel={t('saving')}
             >
-              {saving ? t('saving') : t('save')}
-            </button>
+              {t('save')}
+            </ActionButton>
           </div>
         </form>
       </Modal>

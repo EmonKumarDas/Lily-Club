@@ -45,7 +45,11 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   onCreated,
 }) => {
   const [hallId, setHallId] = useState(initialHallId || halls[0]?.id || '');
+  const [customerMode, setCustomerMode] = useState<'NEW' | 'EXISTING'>('NEW');
   const [customerId, setCustomerId] = useState(customers[0]?.id || '');
+  const [newCustName, setNewCustName] = useState('');
+  const [newCustPhone, setNewCustPhone] = useState('');
+  const [newCustLocation, setNewCustLocation] = useState('');
   const [eventDate, setEventDate] = useState(initialDate || new Date().toISOString().slice(0, 10));
   const [slot, setSlot] = useState<'DAY' | 'NIGHT' | 'FULL'>(initialSlot || 'DAY');
   const [eventType, setEventType] = useState<'WEDDING' | 'HOLUD' | 'RECEPTION' | 'BIRTHDAY' | 'MEETING' | 'OTHER'>('WEDDING');
@@ -72,6 +76,10 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       const hId = initialHallId || halls[0]?.id || '';
       setHallId(hId);
       setCustomerId(customers[0]?.id || '');
+      setCustomerMode('NEW');
+      setNewCustName('');
+      setNewCustPhone('');
+      setNewCustLocation('');
       if (initialDate) setEventDate(initialDate);
       if (initialSlot) setSlot(initialSlot);
     }
@@ -86,20 +94,67 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   }, [hallId, slot, halls]);
 
   const handleSave = async () => {
-    if (!hallId || !customerId || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) {
+    if (!hallId || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) {
       Alert.alert(
         lang === 'bn' ? 'তথ্য অসম্পূর্ণ' : 'Missing Fields',
-        lang === 'bn' ? 'হল, গ্রাহক এবং YYYY-MM-DD তারিখ দিন।' : 'Select hall, customer, and valid YYYY-MM-DD date.'
+        lang === 'bn' ? 'হল এবং YYYY-MM-DD তারিখ দিন।' : 'Select hall and valid YYYY-MM-DD date.'
       );
       return;
     }
+
+    let resolvedCustomerId = customerId;
+    if (customerMode === 'NEW') {
+      if (newCustName.trim().length < 2 || newCustPhone.trim().length < 5) {
+        Alert.alert(
+          lang === 'bn' ? 'গ্রাহকের তথ্য দিন' : 'Customer Info Required',
+          lang === 'bn'
+            ? 'গ্রাহকের নাম (কমপক্ষে ২ অক্ষর) এবং সঠিক ফোন নম্বর দিন।'
+            : 'Please enter customer name and valid phone number.'
+        );
+        return;
+      }
+    } else if (!resolvedCustomerId) {
+      Alert.alert(
+        lang === 'bn' ? 'গ্রাহক নির্বাচন করুন' : 'Select Customer',
+        lang === 'bn' ? 'তালিকা থেকে একজন গ্রাহক নির্বাচন করুন।' : 'Please select an existing customer.'
+      );
+      return;
+    }
+
     setSaving(true);
     try {
+      if (customerMode === 'NEW') {
+        try {
+          const custRes = await apiFetch<{ customer: any }>(`/api/rooms/${roomId}/customers`, {
+            method: 'POST',
+            body: JSON.stringify({
+              name: newCustName.trim(),
+              phone: newCustPhone.trim(),
+              address: newCustLocation.trim() || null,
+            }),
+          });
+          resolvedCustomerId = custRes.customer.id;
+        } catch (custErr: any) {
+          if (custErr?.status === 409) {
+            const checkRes = await apiFetch<{ exists: boolean; customer?: any }>(
+              `/api/rooms/${roomId}/customers/check-phone?phone=${encodeURIComponent(newCustPhone.trim())}`
+            );
+            if (checkRes.exists && checkRes.customer?.id) {
+              resolvedCustomerId = checkRes.customer.id;
+            } else {
+              throw custErr;
+            }
+          } else {
+            throw custErr;
+          }
+        }
+      }
+
       await apiFetch(`/api/rooms/${roomId}/bookings`, {
         method: 'POST',
         body: JSON.stringify({
           hall_id: hallId,
-          customer_id: customerId,
+          customer_id: resolvedCustomerId,
           event_date: eventDate,
           slot,
           event_type: eventType,
@@ -161,34 +216,100 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             })}
           </ScrollView>
 
-          {/* Searchable Customer Dropdown */}
-          <Text style={[styles.label, { color: colors.textMuted }]}>{lang === 'bn' ? 'গ্রাহক নির্বাচন' : 'Customer'}</Text>
-          <TouchableOpacity
-            onPress={() => {
-              setCustQuery('');
-              setCustPickerOpen(true);
-            }}
-            style={[
-              styles.dropdownTrigger,
-              { backgroundColor: colors.card, borderColor: colors.border },
-            ]}
-          >
-            <View style={{ flex: 1 }}>
-              <Text style={{ color: selectedCustomer ? colors.text : colors.textMuted, fontWeight: '700', fontSize: 14 }} numberOfLines={1}>
-                {selectedCustomer
-                  ? selectedCustomer.name
-                  : lang === 'bn'
-                  ? 'গ্রাহক নির্বাচন করুন...'
-                  : 'Select customer...'}
-              </Text>
-              {selectedCustomer?.phone ? (
-                <Text style={{ color: colors.primary, fontSize: 12, fontWeight: '600', marginTop: 2 }}>
-                  📞 {selectedCustomer.phone}
+          {/* Customer Details (Inline New Customer OR Select Existing) */}
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, marginBottom: 6 }}>
+            <Text style={[styles.label, { color: colors.textMuted, marginTop: 0, marginBottom: 0 }]}>
+              {lang === 'bn' ? 'গ্রাহকের তথ্য' : 'Customer Details'}
+            </Text>
+            <View style={{ flexDirection: 'row', gap: 6 }}>
+              <TouchableOpacity
+                onPress={() => setCustomerMode('NEW')}
+                style={{
+                  paddingHorizontal: 10,
+                  paddingVertical: 5,
+                  borderRadius: 16,
+                  borderWidth: 1,
+                  backgroundColor: customerMode === 'NEW' ? colors.primary : colors.card,
+                  borderColor: customerMode === 'NEW' ? colors.primary : colors.border,
+                }}
+              >
+                <Text style={{ fontSize: 11, fontWeight: '800', color: customerMode === 'NEW' ? '#fff' : colors.text }}>
+                  + {lang === 'bn' ? 'নতুন গ্রাহক' : 'New'}
                 </Text>
-              ) : null}
+              </TouchableOpacity>
+              {customers.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setCustomerMode('EXISTING')}
+                  style={{
+                    paddingHorizontal: 10,
+                    paddingVertical: 5,
+                    borderRadius: 16,
+                    borderWidth: 1,
+                    backgroundColor: customerMode === 'EXISTING' ? colors.primary : colors.card,
+                    borderColor: customerMode === 'EXISTING' ? colors.primary : colors.border,
+                  }}
+                >
+                  <Text style={{ fontSize: 11, fontWeight: '800', color: customerMode === 'EXISTING' ? '#fff' : colors.text }}>
+                    {lang === 'bn' ? 'পুরাতন গ্রাহক' : 'Existing'}
+                  </Text>
+                </TouchableOpacity>
+              )}
             </View>
-            <Ionicons name="chevron-down" size={20} color={colors.textMuted} />
-          </TouchableOpacity>
+          </View>
+
+          {customerMode === 'NEW' ? (
+            <View style={{ gap: 8 }}>
+              <TextInput
+                value={newCustName}
+                onChangeText={setNewCustName}
+                placeholder={lang === 'bn' ? 'গ্রাহকের নাম *' : 'Customer Name *'}
+                placeholderTextColor={colors.textMuted}
+                style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.text }]}
+              />
+              <TextInput
+                value={newCustPhone}
+                onChangeText={setNewCustPhone}
+                keyboardType="phone-pad"
+                placeholder={lang === 'bn' ? 'মোবাইল নম্বর * (যেমন: 017...)' : 'Phone Number *'}
+                placeholderTextColor={colors.textMuted}
+                style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.text }]}
+              />
+              <TextInput
+                value={newCustLocation}
+                onChangeText={setNewCustLocation}
+                placeholder={lang === 'bn' ? 'ঠিকানা / লোকেশন (ঐচ্ছিক)' : 'Location / Address (Optional)'}
+                placeholderTextColor={colors.textMuted}
+                style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.text }]}
+              />
+            </View>
+          ) : (
+            <TouchableOpacity
+              onPress={() => {
+                setCustQuery('');
+                setCustPickerOpen(true);
+              }}
+              style={[
+                styles.dropdownTrigger,
+                { backgroundColor: colors.card, borderColor: colors.border },
+              ]}
+            >
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: selectedCustomer ? colors.text : colors.textMuted, fontWeight: '700', fontSize: 14 }} numberOfLines={1}>
+                  {selectedCustomer
+                    ? selectedCustomer.name
+                    : lang === 'bn'
+                    ? 'গ্রাহক নির্বাচন করুন...'
+                    : 'Select customer...'}
+                </Text>
+                {selectedCustomer?.phone ? (
+                  <Text style={{ color: colors.primary, fontSize: 12, fontWeight: '600', marginTop: 2 }}>
+                    📞 {selectedCustomer.phone}
+                  </Text>
+                ) : null}
+              </View>
+              <Ionicons name="chevron-down" size={20} color={colors.textMuted} />
+            </TouchableOpacity>
+          )}
 
           {/* Slot Picker: DAY / NIGHT / FULL */}
           <Text style={[styles.label, { color: colors.textMuted }]}>{lang === 'bn' ? 'স্লট (দিন / রাত / দিন ও রাত)' : 'Slot'}</Text>

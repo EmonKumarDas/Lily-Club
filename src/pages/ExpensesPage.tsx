@@ -13,7 +13,8 @@ import {
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from '../components/Toast.js';
 import { Modal } from '../components/Modal.js';
-import { LoadingSkeleton } from '../components/LoadingSkeleton.js';
+import { SectionLoader } from '../components/Loader.js';
+import { ActionButton, useUnsavedChanges } from '../components/ActionButton.js';
 import { EmptyState } from '../components/EmptyState.js';
 import { DualDatePicker } from '../components/DualDatePicker.js';
 import {
@@ -23,7 +24,7 @@ import {
   formatNumberByLanguage,
   getTodayDhakaYMD,
 } from '../lib/dateUtils.js';
-import { apiRequest } from '../lib/api.js';
+import { apiRequest, generateIdempotencyKey } from '../lib/api.js';
 
 export type ExpenseCategory =
   | 'ELECTRICITY'
@@ -71,6 +72,7 @@ export const ExpensesPage: React.FC = () => {
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
   const [netTotalAmount, setNetTotalAmount] = useState<number>(0);
   const [loading, setLoading] = useState<boolean>(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   // Filters
   const [categoryFilter, setCategoryFilter] = useState<string>('');
@@ -93,6 +95,10 @@ export const ExpensesPage: React.FC = () => {
   const [reversalReason, setReversalReason] = useState<string>('');
   const [reversingSaving, setReversingSaving] = useState<boolean>(false);
 
+  useUnsavedChanges(
+    modalOpen && (amount.trim().length > 0 || note.trim().length > 0 || Boolean(receiptBase64))
+  );
+
   useEffect(() => {
     if (activeRoom && canManage) {
       fetchExpenses();
@@ -104,6 +110,7 @@ export const ExpensesPage: React.FC = () => {
   const fetchExpenses = async () => {
     if (!activeRoom) return;
     setLoading(true);
+    setFetchError(null);
     try {
       const params = new URLSearchParams({
         category: categoryFilter,
@@ -119,7 +126,9 @@ export const ExpensesPage: React.FC = () => {
       setExpenses(res.expenses || []);
       setNetTotalAmount(res.netTotalAmount || 0);
     } catch (err: any) {
-      showError(language === 'bn' ? err.messageBn : err.messageEn);
+      const msg = language === 'bn' ? err.messageBn || 'খরচের তালিকা লোড করতে সমস্যা হয়েছে।' : err.messageEn || 'Failed to load expenses.';
+      setFetchError(msg);
+      showError(msg);
     } finally {
       setLoading(false);
     }
@@ -132,7 +141,7 @@ export const ExpensesPage: React.FC = () => {
     setNote('');
     setReceiptBase64(null);
     setReceiptFileName('');
-    setIdempotencyKey(`exp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+    setIdempotencyKey(generateIdempotencyKey('exp'));
     setModalOpen(true);
   };
 
@@ -190,15 +199,17 @@ export const ExpensesPage: React.FC = () => {
 
     setSaving(true);
     try {
+      const key = idempotencyKey || generateIdempotencyKey('exp');
       const res = await apiRequest(`/api/rooms/${activeRoom.id}/expenses`, {
         method: 'POST',
+        idempotencyKey: key,
         body: JSON.stringify({
           category,
           amount: amt,
           expense_date: expenseDate,
           note: note.trim() || null,
           receipt_image_base64: receiptBase64,
-          idempotency_key: idempotencyKey,
+          idempotency_key: key,
         }),
       });
       showSuccess(language === 'bn' ? res.messageBn : res.messageEn);
@@ -226,6 +237,7 @@ export const ExpensesPage: React.FC = () => {
     try {
       const res = await apiRequest(`/api/rooms/${activeRoom.id}/expenses/${expenseId}/reverse`, {
         method: 'POST',
+        idempotencyKey: generateIdempotencyKey('exp-rev'),
         body: JSON.stringify({
           reason: reversalReason.trim(),
           expense_date: getTodayDhakaYMD(),
@@ -278,13 +290,12 @@ export const ExpensesPage: React.FC = () => {
           </p>
         </div>
 
-        <button
+        <ActionButton
           onClick={openNewExpenseModal}
-          className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs sm:text-sm font-bold shadow-md cursor-pointer self-start sm:self-auto"
+          icon={<Plus className="w-4 h-4" />}
         >
-          <Plus className="w-4 h-4" />
-          <span>{language === 'bn' ? 'নতুন খরচ যুক্ত করুন' : 'Record Expense'}</span>
-        </button>
+          {language === 'bn' ? 'নতুন খরচ যুক্ত করুন' : 'Record Expense'}
+        </ActionButton>
       </div>
 
       {/* Filters & Net Total Summary */}
@@ -333,9 +344,15 @@ export const ExpensesPage: React.FC = () => {
       </div>
 
       {/* Expense List */}
-      {loading ? (
-        <LoadingSkeleton rows={4} />
-      ) : expenses.length === 0 ? (
+      <SectionLoader
+        loading={loading}
+        error={fetchError}
+        onRetry={fetchExpenses}
+        language={language}
+        labelBn="খরচের তথ্য লোড হচ্ছে..."
+        labelEn="Loading expenses..."
+      >
+        {expenses.length === 0 ? (
         <EmptyState
           icon={CreditCard}
           title={language === 'bn' ? 'কোনো খরচের রেকর্ড নেই' : 'No expenses recorded yet'}
@@ -456,14 +473,14 @@ export const ExpensesPage: React.FC = () => {
                       >
                         {t('cancel')}
                       </button>
-                      <button
-                        type="button"
-                        disabled={reversingSaving}
+                      <ActionButton
+                        variant="danger"
+                        loading={reversingSaving}
                         onClick={() => handleReverseExpense(exp.id)}
-                        className="px-3.5 py-1 rounded-lg bg-rose-600 text-white text-xs font-bold cursor-pointer"
+                        className="!px-3.5 !py-1.5 !min-h-[36px] !text-xs"
                       >
                         {language === 'bn' ? 'রিভার্সাল নিশ্চিত করুন' : 'Confirm Reversal'}
-                      </button>
+                      </ActionButton>
                     </div>
                   </div>
                 )}
@@ -471,7 +488,8 @@ export const ExpensesPage: React.FC = () => {
             );
           })}
         </div>
-      )}
+        )}
+      </SectionLoader>
 
       {/* New Expense Modal */}
       <Modal
@@ -566,13 +584,13 @@ export const ExpensesPage: React.FC = () => {
             >
               {t('cancel')}
             </button>
-            <button
+            <ActionButton
               type="submit"
-              disabled={saving}
-              className="px-5 py-2.5 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs font-bold shadow-md disabled:opacity-50 cursor-pointer"
+              loading={saving}
+              loadingLabel={t('saving')}
             >
-              {saving ? t('saving') : t('save')}
-            </button>
+              {t('save')}
+            </ActionButton>
           </div>
         </form>
       </Modal>

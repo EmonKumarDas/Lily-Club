@@ -8,6 +8,9 @@ function detectExpoHostUrl(): string | null {
       const match = scriptURL.match(/^https?:\/\/([^/:]+)(?::\d+)?/i);
       const host = match?.[1];
       if (host && host !== 'localhost' && host !== '127.0.0.1') {
+        if (host.includes('exp.direct') || host.includes('ngrok') || host.includes('loca.lt')) {
+          return null;
+        }
         return `http://${host}:3000`;
       }
     }
@@ -15,38 +18,35 @@ function detectExpoHostUrl(): string | null {
   return null;
 }
 
-export const DEFAULT_SERVER_URL = detectExpoHostUrl() || 'http://10.218.141.155:3000';
+const ENV_SERVER_URL = (process.env.EXPO_PUBLIC_API_URL || '').trim();
+export const DEFAULT_SERVER_URL = ENV_SERVER_URL || detectExpoHostUrl() || 'http://localhost:3000';
 const KEY_SERVER_URL = 'lily_mobile_server_url';
 const KEY_AUTH_TOKEN = 'lily_mobile_auth_token';
+export const CLIENT_APP_VERSION = '1.0.0';
 
 export class ApiError extends Error {
   status: number;
   isOffline: boolean;
   code?: string;
-  constructor(message: string, opts: { status?: number; isOffline?: boolean; code?: string } = {}) {
+  data?: any;
+  constructor(
+    message: string,
+    opts: { status?: number; isOffline?: boolean; code?: string; data?: any } = {}
+  ) {
     super(message);
     this.status = opts.status || 0;
     this.isOffline = Boolean(opts.isOffline);
     this.code = opts.code;
+    this.data = opts.data;
   }
-}
-
-function isLocalLanUrl(url: string): boolean {
-  return /^http:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(url);
 }
 
 export async function getServerUrl(): Promise<string> {
-  const expoHostUrl = detectExpoHostUrl();
   const saved = await AsyncStorage.getItem(KEY_SERVER_URL);
   if (saved) {
-    // If saved URL is an old stale LAN IP and Expo Metro reports the current PC IP, auto-update!
-    if (expoHostUrl && isLocalLanUrl(saved) && saved !== expoHostUrl) {
-      await AsyncStorage.setItem(KEY_SERVER_URL, expoHostUrl);
-      return expoHostUrl;
-    }
     return saved.replace(/\/+$/, '');
   }
-  return (expoHostUrl || DEFAULT_SERVER_URL).replace(/\/+$/, '');
+  return DEFAULT_SERVER_URL.replace(/\/+$/, '');
 }
 
 export async function setServerUrl(url: string): Promise<void> {
@@ -65,18 +65,36 @@ export async function setAuthToken(token: string | null): Promise<void> {
   }
 }
 
+export async function clearAllMobileCachedData(): Promise<void> {
+  const keys = await AsyncStorage.getAllKeys();
+  const removable = keys.filter((k) => k !== 'lily_mobile_theme' && k !== KEY_SERVER_URL);
+  if (removable.length > 0) {
+    await AsyncStorage.multiRemove(removable);
+  }
+}
+
+export function generateIdempotencyKey(prefix = 'mob'): string {
+  const rand = Math.random().toString(36).slice(2, 12);
+  return `${prefix}-${Date.now()}-${rand}`;
+}
+
 export async function apiFetch<T = any>(
   endpoint: string,
-  options: RequestInit = {},
-  timeoutMs = 10000
+  options: RequestInit & { idempotencyKey?: string } = {},
+  timeoutMs = 15000
 ): Promise<T> {
   const baseUrl = await getServerUrl();
   const token = await getAuthToken();
 
   const headers: Record<string, string> = {
     Accept: 'application/json',
+    'X-Client-Version': CLIENT_APP_VERSION,
     ...((options.headers as Record<string, string>) || {}),
   };
+
+  if (options.idempotencyKey) {
+    headers['X-Idempotency-Key'] = options.idempotencyKey;
+  }
 
   if (options.body && !(options.body instanceof FormData) && !headers['Content-Type']) {
     headers['Content-Type'] = 'application/json';
@@ -109,12 +127,14 @@ export async function apiFetch<T = any>(
         status: res.status,
         code: data.error,
         isOffline: false,
+        data,
       });
     }
     return data as T;
   } catch (err: any) {
     clearTimeout(timer);
     if (err instanceof ApiError) throw err;
+
     throw new ApiError(
       err?.name === 'AbortError'
         ? 'সার্ভার থেকে উত্তর পাওয়া যাচ্ছে না (Timeout)'

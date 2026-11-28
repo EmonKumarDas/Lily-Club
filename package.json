@@ -10,7 +10,13 @@
     "start": "tsx server/index.ts",
     "dev:server": "tsx watch server/index.ts",
     "dev:client": "vite",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --import ./tests/setup-env.mjs --test tests/*.test.ts",
+    "test:rules": "firebase emulators:exec --only firestore \"npx tsx --test tests/emulator/firestore_rules.test.ts\"",
+    "db:backup": "node scripts/backup-db.mjs",
+    "security:scan": "node scripts/secret-scan.mjs",
+    "dev:all": "concurrently -n \"SERVER,TUNNEL,EXPO\" -c \"blue,green,yellow\" \"tsx server/index.ts\" \"npx localtunnel --port 3000 --subdomain lily-cc-api\" \"cd mobile && npx expo start --clear\"",
+    "mobile:start": "cd mobile && npx expo start",
+    "mobile:tunnel": "cd mobile && npx expo start --tunnel",
     "cap:sync": "vite build && cap sync android",
     "cap:open": "cap open android",
     "apk": "vite build && cap sync android && cd android && gradlew.bat assembleDebug"
@@ -27,6 +33,8 @@
     "cors": "^2.8.6",
     "dotenv": "^18.0.10",
     "express": "^5.3.0",
+    "firebase": "^13.4.0",
+    "firebase-admin": "^14.5.1",
     "helmet": "^8.3.0",
     "lucide-react": "^1.76.0",
     "react": "^19.3.1",
@@ -35,6 +43,7 @@
   },
   "devDependencies": {
     "@capacitor/cli": "^8.6.2",
+    "@firebase/rules-unit-testing": "^6.0.0",
     "@tailwindcss/vite": "^4.3.5",
     "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
@@ -44,10 +53,14 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
     "autoprefixer": "^10.6.2",
+    "concurrently": "^10.0.7",
     "postcss": "^8.5.33",
     "tailwindcss": "^4.3.5",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vite": "^8.3.8"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.13.6"
   }
 }

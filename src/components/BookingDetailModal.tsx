@@ -18,7 +18,8 @@ import {
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from './Toast.js';
 import { Modal } from './Modal.js';
-import { LoadingSkeleton } from './LoadingSkeleton.js';
+import { SectionLoader } from './Loader.js';
+import { ActionButton, useUnsavedChanges } from './ActionButton.js';
 import { SlotBadge, type SlotType } from './SlotBadge.js';
 import { DualDatePicker } from './DualDatePicker.js';
 import {
@@ -32,7 +33,7 @@ import {
   isNightCrossingMidnight,
   toBanglaDigits,
 } from '../lib/dateUtils.js';
-import { apiRequest } from '../lib/api.js';
+import { apiRequest, generateIdempotencyKey } from '../lib/api.js';
 
 interface BookingDetailModalProps {
   bookingId: string | null;
@@ -56,6 +57,7 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
   const [history, setHistory] = useState<any[]>([]);
   const [payments, setPayments] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'overview' | 'payments' | 'notes' | 'history'>('overview');
 
   const role = activeMember?.role;
@@ -89,6 +91,10 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
   const [reversingPaymentId, setReversingPaymentId] = useState<string | null>(null);
   const [reversalReason, setReversalReason] = useState<string>('');
 
+  useUnsavedChanges(
+    isOpen && (payAmount.trim().length > 0 || cancelReason.trim().length > 0)
+  );
+
   useEffect(() => {
     if (isOpen && bookingId && activeRoom) {
       fetchDetail();
@@ -117,6 +123,7 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
   const fetchDetail = async () => {
     if (!activeRoom || !bookingId) return;
     setLoading(true);
+    setFetchError(null);
     try {
       const res = await apiRequest<{ booking: any; history: any[] }>(
         `/api/rooms/${activeRoom.id}/bookings/${bookingId}`
@@ -133,7 +140,9 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
         setPayments([]);
       }
     } catch (err: any) {
-      showError(language === 'bn' ? err.messageBn : err.messageEn);
+      const msg = language === 'bn' ? err.messageBn || 'বুকিং লোড করতে সমস্যা হয়েছে।' : err.messageEn || 'Failed to load booking details.';
+      setFetchError(msg);
+      showError(msg);
     } finally {
       setLoading(false);
     }
@@ -145,6 +154,7 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
     try {
       const res = await apiRequest(`/api/rooms/${activeRoom.id}/bookings/${booking.id}`, {
         method: 'PATCH',
+        idempotencyKey: generateIdempotencyKey('confirm-booking'),
         body: JSON.stringify({ status: 'CONFIRMED' }),
       });
       showSuccess(language === 'bn' ? res.messageBn : res.messageEn);
@@ -172,6 +182,7 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
     try {
       const res = await apiRequest(`/api/rooms/${activeRoom.id}/bookings/${booking.id}/cancel`, {
         method: 'POST',
+        idempotencyKey: generateIdempotencyKey('cancel-booking'),
         body: JSON.stringify({
           reason: cancelReason.trim(),
           refund_amount: canSeeMoney && refundOnCancel > 0 ? Number(refundOnCancel) : 0,
@@ -206,8 +217,10 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
 
     setSavingPayment(true);
     try {
+      const key = payIdempotencyKey || generateIdempotencyKey('pay');
       const res = await apiRequest(`/api/rooms/${activeRoom.id}/bookings/${booking.id}/payments`, {
         method: 'POST',
+        idempotencyKey: key,
         body: JSON.stringify({
           payment_type: payType,
           amount: amt,
@@ -216,7 +229,7 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
           reference_number: payRef.trim() || null,
           note: payNote.trim() || null,
           confirm_overpayment: confirmOverpay,
-          idempotency_key: payIdempotencyKey,
+          idempotency_key: key,
         }),
       });
       showSuccess(language === 'bn' ? res.messageBn : res.messageEn);
@@ -249,6 +262,7 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
         `/api/rooms/${activeRoom.id}/bookings/${booking.id}/payments/${paymentId}/reverse`,
         {
           method: 'POST',
+          idempotencyKey: generateIdempotencyKey('pay-rev'),
           body: JSON.stringify({
             reason: reversalReason.trim(),
             payment_date: getTodayDhakaYMD(),
@@ -610,14 +624,20 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
       }
       maxWidth="lg"
     >
-      {loading || !booking ? (
-        <LoadingSkeleton rows={4} />
-      ) : (
+      <SectionLoader
+        loading={loading || (!booking && !fetchError)}
+        error={fetchError}
+        onRetry={fetchDetail}
+        language={language}
+        labelBn="বুকিং বিবরণ লোড হচ্ছে..."
+        labelEn="Loading booking details..."
+      >
+        {booking && (
         <div className="space-y-5">
           {/* Header Badges & Action Bar */}
           <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-stone-200 dark:border-stone-800">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="font-mono text-base sm:text-lg font-extrabold text-[#582C4D] dark:text-[#C5A059]">
+              <span className="font-mono text-base sm:text-lg font-extrabold text-[#4A2545] dark:text-[#C5A059]">
                 {booking.booking_number}
               </span>
               <SlotBadge slot={booking.slot as SlotType} size="sm" showDualLang />
@@ -632,46 +652,48 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
 
             <div className="flex flex-wrap items-center gap-2">
               {canEdit && booking.status === 'TENTATIVE' && (
-                <button
+                <ActionButton
                   onClick={handleConfirmStatus}
-                  disabled={actionSaving}
-                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs cursor-pointer"
+                  loading={actionSaving}
+                  icon={<CheckCircle2 className="w-3.5 h-3.5" />}
+                  className="!bg-[#0E8A44] hover:!bg-[#0B7137] !border-[#0E8A44] !px-3 !py-1.5 !min-h-[38px] !text-xs"
                 >
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>{t('confirm')}</span>
-                </button>
+                  {t('confirm')}
+                </ActionButton>
               )}
 
               {canEdit && booking.status !== 'CANCELLED' && (
-                <button
+                <ActionButton
+                  variant="ghost"
                   onClick={() => {
                     onClose();
                     onEditBooking(booking);
                   }}
-                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-stone-100 dark:bg-stone-800 hover:bg-stone-200 text-stone-800 dark:text-stone-200 text-xs font-bold cursor-pointer"
+                  icon={<Edit3 className="w-3.5 h-3.5" />}
+                  className="!px-3 !py-1.5 !min-h-[38px] !text-xs"
                 >
-                  <Edit3 className="w-3.5 h-3.5" />
-                  <span>{language === 'bn' ? 'সম্পাদনা' : 'Edit'}</span>
-                </button>
+                  {language === 'bn' ? 'সম্পাদনা' : 'Edit'}
+                </ActionButton>
               )}
 
               {canCancel && booking.status !== 'CANCELLED' && (
-                <button
+                <ActionButton
+                  variant="danger"
                   onClick={() => setShowCancelPrompt((v) => !v)}
-                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 hover:bg-rose-100 text-xs font-bold cursor-pointer"
+                  icon={<XCircle className="w-3.5 h-3.5" />}
+                  className="!px-3 !py-1.5 !min-h-[38px] !text-xs"
                 >
-                  <XCircle className="w-3.5 h-3.5" />
-                  <span>{t('cancel')}</span>
-                </button>
+                  {t('cancel')}
+                </ActionButton>
               )}
 
-              <button
+              <ActionButton
                 onClick={handlePrintBookingSlip}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs font-bold shadow-xs cursor-pointer"
+                icon={<Printer className="w-3.5 h-3.5" />}
+                className="!px-3 !py-1.5 !min-h-[38px] !text-xs"
               >
-                <Printer className="w-3.5 h-3.5" />
-                <span>{language === 'bn' ? 'বুকিং স্লিপ প্রিন্ট' : 'Print Slip'}</span>
-              </button>
+                {language === 'bn' ? 'বুকিং স্লিপ প্রিন্ট' : 'Print Slip'}
+              </ActionButton>
             </div>
           </div>
 
@@ -746,13 +768,14 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
                 >
                   {t('back')}
                 </button>
-                <button
+                <ActionButton
                   type="submit"
-                  disabled={actionSaving}
-                  className="px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold cursor-pointer"
+                  variant="danger"
+                  loading={actionSaving}
+                  className="!px-4 !py-1.5 !min-h-[38px] !text-xs"
                 >
                   {language === 'bn' ? 'বুকিং বাতিল নিশ্চিত করুন' : 'Confirm Cancellation'}
-                </button>
+                </ActionButton>
               </div>
             </form>
           )}
@@ -1088,20 +1111,16 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
                     )}
 
                     <div className="flex justify-end">
-                      <button
+                      <ActionButton
                         type="submit"
-                        disabled={savingPayment}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs font-bold shadow-xs disabled:opacity-50 cursor-pointer"
+                        loading={savingPayment}
+                        loadingLabel={t('saving')}
+                        icon={<Receipt className="w-3.5 h-3.5" />}
                       >
-                        <Receipt className="w-3.5 h-3.5" />
-                        <span>
-                          {savingPayment
-                            ? t('saving')
-                            : language === 'bn'
-                            ? 'পেমেন্ট সংরক্ষণ ও রিসিট তৈরি করুন'
-                            : 'Save Payment & Generate Receipt'}
-                        </span>
-                      </button>
+                        {language === 'bn'
+                          ? 'পেমেন্ট সংরক্ষণ ও রিসিট তৈরি করুন'
+                          : 'Save Payment & Generate Receipt'}
+                      </ActionButton>
                     </div>
                   </form>
 
@@ -1244,16 +1263,16 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
                                     >
                                       {t('cancel')}
                                     </button>
-                                    <button
-                                      type="button"
-                                      disabled={actionSaving}
+                                    <ActionButton
+                                      variant="danger"
+                                      loading={actionSaving}
                                       onClick={() => handleReversePayment(p.id)}
-                                      className="px-3 py-1 rounded-lg bg-rose-600 text-white text-[11px] font-bold cursor-pointer"
+                                      className="!px-3 !py-1 !min-h-[32px] !text-[11px]"
                                     >
                                       {language === 'bn'
                                         ? 'রিভার্সাল এন্ট্রি নিশ্চিত করুন'
                                         : 'Confirm Reversal'}
-                                    </button>
+                                    </ActionButton>
                                   </div>
                                 </div>
                               )}
@@ -1315,7 +1334,8 @@ export const BookingDetailModal: React.FC<BookingDetailModalProps> = ({
             </div>
           )}
         </div>
-      )}
+        )}
+      </SectionLoader>
     </Modal>
   );
 };

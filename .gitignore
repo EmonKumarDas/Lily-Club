@@ -8,14 +8,18 @@ node_modules/
 .env.local
 .env.*.local
 
-# Databases & local data
+# Databases, backups, uploads & local data
 data/*.db
 data/*.sqlite
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+data/backups/
+data/uploads/
 *.db
 *.sqlite
+*firebase-adminsdk*.json
+data/firebase-service-account.json
 
 # Production build outputs
 dist/

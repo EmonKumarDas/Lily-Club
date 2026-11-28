@@ -12,12 +12,14 @@ import {
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from '../components/Toast.js';
 import { Modal } from '../components/Modal.js';
-import { LoadingSkeleton } from '../components/LoadingSkeleton.js';
+import { SectionLoader } from '../components/Loader.js';
 import { SlotBadge, SlotIcon, type SlotType } from '../components/SlotBadge.js';
 import {
   getBengaliDate,
   parseEventDateToDhakaDate,
   formatDualDateFromYMD,
+  formatFullDualDateWithWeekdayFromYMD,
+  formatDualMonthHeader,
   formatTimeString12,
   formatNumberByLanguage,
   getNextDayYMD,
@@ -60,6 +62,7 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
   // Bookings in range
   const [bookings, setBookings] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   // Day Inspection Modal when tapping a day cell
   const [selectedDayYMD, setSelectedDayYMD] = useState<string | null>(null);
@@ -95,6 +98,7 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
   const fetchMonthBookings = async () => {
     if (!activeRoom) return;
     setLoading(true);
+    setFetchError(null);
     try {
       const params = new URLSearchParams({
         dateFrom,
@@ -108,13 +112,14 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
       const res = await apiRequest<{ bookings: any[] }>(
         `/api/rooms/${activeRoom.id}/bookings?${params.toString()}`
       );
-      // Exclude CANCELLED bookings from occupying calendar cells unless explicitly filtered for CANCELLED
       const activeList = (res.bookings || []).filter((b) =>
         statusFilter === 'CANCELLED' ? true : b.status !== 'CANCELLED'
       );
       setBookings(activeList);
     } catch (err: any) {
-      showError(language === 'bn' ? err.messageBn : err.messageEn);
+      const msg = (language === 'bn' ? err.messageBn : err.messageEn) || err.message || 'Failed to load calendar';
+      setFetchError(msg);
+      showError(msg);
     } finally {
       setLoading(false);
     }
@@ -156,6 +161,7 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
       ymd: string;
       gDay: number;
       gDayBn: string;
+      bDay: number;
       bDayBn: string;
       bMonthBn: string;
       bMonthEn: string;
@@ -170,6 +176,7 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
         ymd,
         gDay: d,
         gDayBn: toBanglaDigits(d),
+        bDay: bInfo.day,
         bDayBn: bInfo.dayBn,
         bMonthBn: bInfo.monthBn,
         bMonthEn: bInfo.monthEn,
@@ -177,6 +184,11 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
     }
     return list;
   }, [currentYear, currentMonth]);
+
+  const firstVisibleCellIdx = useMemo(
+    () => monthCells.findIndex((c) => c !== null),
+    [monthCells]
+  );
 
   // Build 7-day Week View cells around weekAnchorYMD
   const weekDays = useMemo(() => {
@@ -411,39 +423,44 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
         </div>
       </div>
 
-      {/* Month & Bengali Year Navigation Bar */}
-      <div className="flex items-center justify-between p-4 rounded-2xl bg-white dark:bg-[#1E1920] border border-stone-200 dark:border-stone-800 shadow-xs">
+      {/* Month & Bengali Year Navigation Bar (Section 8: "November 2026 | কার্তিক–অগ্রহায়ণ ১৪৩৩") */}
+      <div className="flex items-center justify-between p-4 rounded-2xl bg-white dark:bg-[#1D1820] border border-stone-200 dark:border-stone-800 shadow-xs">
         <button
           onClick={handlePrev}
-          className="p-2 rounded-xl bg-stone-100 dark:bg-stone-800 hover:bg-stone-200 text-stone-700 dark:text-stone-200 cursor-pointer"
+          aria-label="Previous month"
+          className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl bg-stone-100 dark:bg-stone-800 hover:bg-stone-200 text-stone-700 dark:text-stone-200 cursor-pointer"
         >
           <ChevronLeft className="w-5 h-5" />
         </button>
 
-        <div className="text-center">
-          <h2 className="text-base sm:text-lg font-extrabold text-stone-900 dark:text-stone-100">
-            {GREGORIAN_MONTHS_BN[currentMonth]} {toBanglaDigits(currentYear)} •{' '}
-            {GREGORIAN_MONTHS_EN[currentMonth]} {currentYear}
+        <div className="text-center px-2">
+          <h2 className="text-sm sm:text-lg font-extrabold text-stone-900 dark:text-stone-100">
+            {formatDualMonthHeader(currentYear, currentMonth, language)}
           </h2>
-          <p className="text-xs font-bold text-[#582C4D] dark:text-[#C5A059] mt-0.5">
+          <p className="text-[11px] font-semibold text-[#4A2545] dark:text-[#C5A059] mt-0.5">
             {bengaliMonthHeader}
           </p>
         </div>
 
         <button
           onClick={handleNext}
-          className="p-2 rounded-xl bg-stone-100 dark:bg-stone-800 hover:bg-stone-200 text-stone-700 dark:text-stone-200 cursor-pointer"
+          aria-label="Next month"
+          className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl bg-stone-100 dark:bg-stone-800 hover:bg-stone-200 text-stone-700 dark:text-stone-200 cursor-pointer"
         >
           <ChevronRight className="w-5 h-5" />
         </button>
       </div>
 
-      {loading ? (
-        <LoadingSkeleton rows={6} />
-      ) : viewMode === 'month' ? (
+      <SectionLoader
+        loading={loading}
+        error={fetchError}
+        onRetry={fetchMonthBookings}
+        language={language}
+      >
+        {viewMode === 'month' ? (
         /* ======================== MONTH VIEW (Split Day / Night Cells) ======================== */
-        <div className="bg-white dark:bg-[#1E1920] border border-stone-200 dark:border-stone-800 rounded-3xl p-2 sm:p-4 shadow-xs">
-          {/* Weekday Headers */}
+        <div className="bg-white dark:bg-[#1D1820] border border-stone-200 dark:border-stone-800 rounded-3xl p-2 sm:p-4 shadow-xs">
+          {/* Weekday Headers in BOTH Languages */}
           <div className="grid grid-cols-7 gap-1 sm:gap-2 text-center pb-2 mb-2 border-b border-stone-100 dark:border-stone-800">
             {WEEKDAYS.map((w) => (
               <div key={w.shortEn} className="text-[11px] font-bold text-stone-500">
@@ -457,7 +474,7 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
           <div className="grid grid-cols-7 gap-1 sm:gap-2">
             {monthCells.map((cell, idx) => {
               if (!cell) {
-                return <div key={`blank-${idx}`} className="min-h-[96px] sm:min-h-[118px]" />;
+                return <div key={`blank-${idx}`} className="min-h-[104px] sm:min-h-[124px]" />;
               }
 
               const dayInfo = bookingsByDate[cell.ymd] || {
@@ -467,33 +484,41 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
               const dayStyle = getHalfCellStatus(dayInfo.dayBookings);
               const nightStyle = getHalfCellStatus(dayInfo.nightBookings);
               const isToday = cell.ymd === todayYMD;
+              // Section 8: Show Bangla month name inside cell on 1st day of each Bangla month AND 1st visible day of grid!
+              const showBanglaMonthInCell = cell.bDay === 1 || idx === firstVisibleCellIdx;
 
               return (
                 <div
                   key={cell.ymd}
                   onClick={() => setSelectedDayYMD(cell.ymd)}
-                  className={`min-h-[98px] sm:min-h-[122px] rounded-2xl border p-1 sm:p-1.5 flex flex-col justify-between transition-all cursor-pointer ${
+                  className={`min-h-[104px] sm:min-h-[126px] rounded-2xl border p-1 sm:p-1.5 flex flex-col justify-between transition-all cursor-pointer ${
                     isToday
-                      ? 'border-2 border-[#582C4D] dark:border-[#C5A059] bg-[#582C4D]/5'
+                      ? 'border-2 border-[#4A2545] dark:border-[#C5A059] bg-[#4A2545]/5'
                       : 'border-stone-200/80 dark:border-stone-800 bg-stone-50/40 dark:bg-stone-900/30'
                   }`}
                 >
-                  {/* Dual Date Numbers Header: English day number AND Bangla day number */}
-                  <div className="flex items-center justify-between px-1 pb-1">
+                  {/* Section 8: English day number (large) AND Bangla day number (small) + Bangla month on 1st of month / 1st visible day */}
+                  <div className="flex items-start justify-between gap-0.5 px-1 pb-1">
                     <span
-                      className="text-xs sm:text-sm font-extrabold text-stone-900 dark:text-stone-100"
+                      className="text-sm sm:text-base font-extrabold text-stone-900 dark:text-stone-100 leading-none"
                       title={`English Day: ${cell.gDay}`}
                     >
                       {cell.gDay}
                     </span>
                     <span
-                      className="text-[10px] sm:text-xs font-extrabold text-[#582C4D] dark:text-[#C5A059]"
+                      className={`text-[10px] sm:text-xs font-extrabold text-right leading-tight ${
+                        showBanglaMonthInCell
+                          ? 'px-1 py-0.5 rounded-md bg-[#4A2545]/10 dark:bg-[#C5A059]/20 text-[#4A2545] dark:text-[#C5A059]'
+                          : 'text-[#4A2545] dark:text-[#C5A059]'
+                      }`}
                       title={`বাংলা তারিখ: ${cell.bDayBn} ${cell.bMonthBn}`}
                     >
-                      {cell.bDayBn}{' '}
-                      <span className="hidden lg:inline text-[9px] font-semibold">
-                        {cell.bMonthBn}
-                      </span>
+                      {cell.bDayBn}
+                      {showBanglaMonthInCell && (
+                        <span className="ml-0.5 text-[8px] sm:text-[9px] font-bold">
+                          {cell.bMonthBn}
+                        </span>
+                      )}
                     </span>
                   </div>
 
@@ -745,12 +770,13 @@ export const CalendarPage: React.FC<CalendarPageProps> = ({
           )}
         </div>
       )}
+      </SectionLoader>
 
-      {/* Day Cell Tap Modal: Shows Day and Night Bookings for that Date */}
+      {/* Day Cell Tap Modal: Shows Full Dual Date with Weekday + Day and Night Bookings */}
       <Modal
         isOpen={Boolean(selectedDayYMD)}
         onClose={() => setSelectedDayYMD(null)}
-        title={selectedDayYMD ? formatDualDateFromYMD(selectedDayYMD) : ''}
+        title={selectedDayYMD ? formatFullDualDateWithWeekdayFromYMD(selectedDayYMD) : ''}
         maxWidth="md"
       >
         {selectedDayYMD && (

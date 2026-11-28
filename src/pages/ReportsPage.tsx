@@ -12,7 +12,8 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext.js';
 import { useToast } from '../components/Toast.js';
-import { LoadingSkeleton } from '../components/LoadingSkeleton.js';
+import { SectionLoader } from '../components/Loader.js';
+import { ActionButton } from '../components/ActionButton.js';
 import { EmptyState } from '../components/EmptyState.js';
 import { SlotBadge, type SlotType } from '../components/SlotBadge.js';
 import { DualDatePicker } from '../components/DualDatePicker.js';
@@ -23,7 +24,7 @@ import {
   getTodayDhakaYMD,
   toBanglaDigits,
 } from '../lib/dateUtils.js';
-import { apiRequest } from '../lib/api.js';
+import { apiRequest, CLIENT_APP_VERSION } from '../lib/api.js';
 import type { HallItem } from './HallsPage.js';
 
 export const ReportsPage: React.FC<{
@@ -51,6 +52,7 @@ export const ReportsPage: React.FC<{
 
   const [report, setReport] = useState<any | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [exporting, setExporting] = useState<boolean>(false);
 
   useEffect(() => {
@@ -72,6 +74,7 @@ export const ReportsPage: React.FC<{
   const fetchReport = async () => {
     if (!activeRoom) return;
     setLoading(true);
+    setFetchError(null);
     try {
       const params = new URLSearchParams({
         dateFrom,
@@ -84,7 +87,9 @@ export const ReportsPage: React.FC<{
       );
       setReport(res.report);
     } catch (err: any) {
-      showError(language === 'bn' ? err.messageBn : err.messageEn);
+      const msg = language === 'bn' ? err.messageBn || 'প্রতিবেদন লোড করতে সমস্যা হয়েছে।' : err.messageEn || 'Failed to load report.';
+      setFetchError(msg);
+      showError(msg);
     } finally {
       setLoading(false);
     }
@@ -117,7 +122,10 @@ export const ReportsPage: React.FC<{
       });
       const response = await fetch(
         `/api/rooms/${activeRoom.id}/reports/export?${params.toString()}`,
-        { credentials: 'include' }
+        {
+          credentials: 'include',
+          headers: { 'X-Client-Version': CLIENT_APP_VERSION },
+        }
       );
       if (!response.ok) {
         const errJson = await response.json().catch(() => ({}));
@@ -356,23 +364,24 @@ export const ReportsPage: React.FC<{
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <button
+          <ActionButton
+            variant="secondary"
             onClick={handleExportCsv}
-            disabled={exporting || loading}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-stone-100 dark:bg-stone-800 hover:bg-stone-200 text-stone-800 dark:text-stone-200 text-xs font-bold cursor-pointer"
+            loading={exporting}
+            disabled={loading}
+            icon={<Download className="w-3.5 h-3.5" />}
           >
-            <Download className="w-3.5 h-3.5" />
-            <span>{language === 'bn' ? 'CSV এক্সপোর্ট' : 'Export CSV'}</span>
-          </button>
+            {language === 'bn' ? 'CSV এক্সপোর্ট' : 'Export CSV'}
+          </ActionButton>
 
-          <button
+          <ActionButton
             onClick={handleExportPdf}
-            disabled={exporting || loading}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#582C4D] hover:bg-[#6C375F] text-white text-xs font-bold shadow-xs cursor-pointer"
+            loading={exporting}
+            disabled={loading}
+            icon={<Printer className="w-3.5 h-3.5" />}
           >
-            <Printer className="w-3.5 h-3.5" />
-            <span>{language === 'bn' ? 'PDF প্রিন্ট / এক্সপোর্ট' : 'Export PDF Report'}</span>
-          </button>
+            {language === 'bn' ? 'PDF প্রিন্ট / এক্সপোর্ট' : 'Export PDF Report'}
+          </ActionButton>
         </div>
       </div>
 
@@ -455,9 +464,15 @@ export const ReportsPage: React.FC<{
         </div>
       </div>
 
-      {loading || !report ? (
-        <LoadingSkeleton rows={6} />
-      ) : (
+      <SectionLoader
+        loading={loading || (!report && !fetchError)}
+        error={fetchError}
+        onRetry={fetchReport}
+        language={language}
+        labelBn="প্রতিবেদন তৈরি হচ্ছে..."
+        labelEn="Generating financial report..."
+      >
+        {report && (
         <div className="space-y-6">
           {/* Top 7 Financial & Operational KPIs */}
           <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
@@ -755,7 +770,8 @@ export const ReportsPage: React.FC<{
             )}
           </div>
         </div>
-      )}
+        )}
+      </SectionLoader>
     </div>
   );
 };

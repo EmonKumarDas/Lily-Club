@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   getBengaliDate,
   formatDualDate,
+  formatFullDualDateWithWeekdayFromYMD,
+  formatDualMonthHeader,
   formatCurrency,
   toBanglaDigits,
   toEnglishDigits,
@@ -169,4 +171,38 @@ test('Currency formatting in BDT', () => {
   assert.equal(formatCurrency(25000, 'en'), '৳25,000');
   assert.equal(formatCurrency(25000, 'bn'), '৳২৫,০০০');
   assert.equal(formatCurrency(1250500, 'bn'), '৳১২,৫০,৫০০');
+});
+
+test('Pohela Boishakh (14 April = ১ বৈশাখ) across multiple years (2024, 2025, 2026, 2027)', () => {
+  const cases = [
+    { gYear: 2024, bYear: 1431, bYearBn: '১৪৩১' },
+    { gYear: 2025, bYear: 1432, bYearBn: '১৪৩২' },
+    { gYear: 2026, bYear: 1433, bYearBn: '১৪৩৩' },
+    { gYear: 2027, bYear: 1434, bYearBn: '১৪৩৪' },
+  ];
+
+  for (const c of cases) {
+    const dt = new Date(`${c.gYear}-04-14T06:00:00Z`);
+    const info = getBengaliDate(dt);
+    assert.equal(info.day, 1);
+    assert.equal(info.dayBn, '১');
+    assert.equal(info.monthBn, 'বৈশাখ');
+    assert.equal(info.year, c.bYear);
+    assert.equal(info.yearBn, c.bYearBn);
+  }
+});
+
+test('26 November 2026, full dual date with weekday, and dual month header', () => {
+  // Under official 2019 Bangladesh Revised Calendar (Ashwin = 31 days, Kartik = 17 Oct..15 Nov, Ogrohayon starts 16 Nov):
+  // 26 November 2026 = ১১ অগ্রহায়ণ ১৪৩৩, বৃহস্পতিবার / Thursday
+  const full26Nov = formatFullDualDateWithWeekdayFromYMD('2026-11-26');
+  assert.ok(full26Nov.includes('বৃহস্পতিবার'));
+  assert.ok(full26Nov.includes('১১ অগ্রহায়ণ ১৪৩৩'));
+  assert.ok(full26Nov.includes('Thursday, 26 November 2026'));
+
+  const novHeaderEn = formatDualMonthHeader(2026, 10, 'en');
+  assert.equal(novHeaderEn, 'November 2026 | কার্তিক–অগ্রহায়ণ ১৪৩৩');
+
+  const aprHeaderBn = formatDualMonthHeader(2026, 3, 'bn');
+  assert.equal(aprHeaderBn, 'এপ্রিল ২০২৬ (April 2026) | চৈত্র ১৪৩২–বৈশাখ ১৪৩৩');
 });

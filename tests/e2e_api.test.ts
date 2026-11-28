@@ -240,12 +240,19 @@ test('E2E: Full Lifecycle - Dev Login, CSRF, Create Room, Join Request, Approval
   });
   assert.equal(approveRes.status, 200);
 
-  // 11. Immediate Effect: Clean Staff can now access the room
-  const staffAccessRes = await makeRequest(`/api/rooms/${roomId}/members`, {
+  // 11. Immediate Effect: Clean Staff can now access operational endpoints (e.g. halls),
+  //     while member directory PII remains restricted to Owner/Manager (403)
+  const staffHallsRes = await makeRequest(`/api/rooms/${roomId}/halls`, {
     cookie: cleanStaffCookie,
     headers: { 'x-room-id': roomId },
   });
-  assert.equal(staffAccessRes.status, 200);
+  assert.equal(staffHallsRes.status, 200);
+
+  const staffMembersBlockedRes = await makeRequest(`/api/rooms/${roomId}/members`, {
+    cookie: cleanStaffCookie,
+    headers: { 'x-room-id': roomId },
+  });
+  assert.equal(staffMembersBlockedRes.status, 403, 'STAFF cannot list other members PII');
 
   // 12. Non-Owner cannot update roles or regenerate code
   const unauthorizedRoleChange = await makeRequest(`/api/rooms/${roomId}/members/${cleanUserId}/role`, {
@@ -256,7 +263,7 @@ test('E2E: Full Lifecycle - Dev Login, CSRF, Create Room, Join Request, Approval
   });
   assert.equal(unauthorizedRoleChange.status, 403);
 
-  // 13. Owner changes Clean Staff role to MANAGER
+  // 13. Owner changes Clean Staff role to MANAGER -> Manager can now read /members
   const roleUpdateRes = await makeRequest(`/api/rooms/${roomId}/members/${cleanUserId}/role`, {
     method: 'PATCH',
     cookie: ownerCookie,
@@ -264,6 +271,12 @@ test('E2E: Full Lifecycle - Dev Login, CSRF, Create Room, Join Request, Approval
     body: { role: 'MANAGER' },
   });
   assert.equal(roleUpdateRes.status, 200);
+
+  const managerMembersRes = await makeRequest(`/api/rooms/${roomId}/members`, {
+    cookie: cleanStaffCookie,
+    headers: { 'x-room-id': roomId },
+  });
+  assert.equal(managerMembersRes.status, 200);
 
   // 14. Room ID Regeneration: Old code revoked immediately, new code works
   const regenRes = await makeRequest(`/api/rooms/${roomId}/regenerate-code`, {

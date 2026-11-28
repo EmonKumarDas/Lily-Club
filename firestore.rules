@@ -1,0 +1,709 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Project: Lily Community Center
+    // Security Model: Strict deny-by-default, multi-tenant room isolation.
+    // All trusted server-side writes/syncs use Firebase Admin SDK (IAM).
+    // Zero client UIDs have superuser or bypass privileges.
+    //
+    // Collection: app_config
+    // Document ID: 'version'
+    // Fields (read-only, server-managed):
+    //   - latestVersion: string
+    //   - minSupportedVersion: string
+    //   - updateUrl: string
+    //   - releaseNotesBn: string
+    //   - releaseNotesEn: string
+    //
+    // Collection: users
+    // Document ID: {userId} (matches Firebase Auth UID)
+    // Fields (PII isolated to owner get-only; role/room/admin fields forbidden):
+    //   - id: string (required, immutable, == userId, 1..128 chars)
+    //   - email: string (required, immutable, valid email, 3..254 chars)
+    //   - name: string (required, 1..100 chars)
+    //   - picture: string | null (optional, http/https URL or empty, max 1000 chars)
+    //   - preferred_language: string (optional, in ['bn', 'en'])
+    //   - created_at: timestamp (required, immutable, == request.time on create)
+    //   - updated_at: timestamp (required, == request.time on create/update)
+    //
+    // Collection: rooms
+    // Document ID: {roomId}
+    // Fields (NEVER contains join_code; create/delete server-only; list denied):
+    //   - id: string (required, immutable, == roomId, 1..128 chars)
+    //   - name: string (required, 1..120 chars)
+    //   - address: string (required, 1..500 chars)
+    //   - phone: string (required, 1..30 chars)
+    //   - email: string | null (optional, valid email or empty, max 254 chars)
+    //   - logo: string | null (optional, URL/path, max 2000 chars)
+    //   - logo_scale: number | null (optional, 0.1..5.0)
+    //   - primary_color: string | null (optional, 4..20 chars)
+    //   - default_language: string (optional, in ['bn', 'en'])
+    //   - join_approval_required: bool (optional)
+    //   - allow_staff_costs: bool (optional)
+    //   - day_start_time: string (optional, HH:MM)
+    //   - day_end_time: string (optional, HH:MM)
+    //   - night_start_time: string (optional, HH:MM)
+    //   - night_end_time: string (optional, HH:MM)
+    //   - buffer_enabled: bool (optional)
+    //   - buffer_minutes: int (optional, 0..1440)
+    //   - created_by: string (required, immutable, 1..128 chars)
+    //   - created_at: timestamp (required, immutable)
+    //   - updated_at: timestamp (required, == request.time on update)
+    //   - is_deleted: bool (optional, immutable from client)
+    //
+    // Collection: room_secrets
+    // Document ID: {roomId}
+    // Fields (strictly active OWNER get-only; server-written):
+    //   - room_id: string
+    //   - join_code: string
+    //   - updated_at: timestamp
+    //
+    // Collection: memberships
+    // Document ID: {membershipId} (${roomId}_${userId})
+    // Fields (all writes server-only):
+    //   - room_id: string (1..128 chars)
+    //   - user_id: string (1..128 chars)
+    //   - role: string (in ['OWNER', 'MANAGER', 'STAFF', 'VIEWER'])
+    //   - status: string (in ['ACTIVE', 'PENDING', 'REJECTED', 'REMOVED', 'SUSPENDED'])
+    //   - created_at: timestamp
+    //   - updated_at: timestamp
+    //
+    // Collection: halls
+    // Document ID: {hallId}
+    // Fields (soft-delete only; create/update restricted to MANAGER and OWNER):
+    //   - id: string (required, immutable, == hallId, 1..128 chars)
+    //   - room_id: string (required, immutable, 1..128 chars)
+    //   - name: string (required, 1..120 chars)
+    //   - capacity: int (required, 1..100000)
+    //   - day_price: number (required, 0..1000000000)
+    //   - night_price: number (required, 0..1000000000)
+    //   - full_price: number (required, 0..1000000000)
+    //   - photos: list<string> (optional, max 10 items, each max 1000 chars)
+    //   - facilities: list<string> (optional, max 20 items, each max 100 chars)
+    //   - description: string | null (optional, max 1000 chars)
+    //   - is_active: bool (required)
+    //   - is_deleted: bool (optional/required bool, must be false on create)
+    //   - created_at: timestamp (required, immutable, == request.time on create)
+    //   - updated_at: timestamp (required, == request.time on create/update)
+    //
+    // Collection: customers
+    // Document ID: {customerId}
+    // Fields (soft-delete only; create/update STAFF+, soft-delete MANAGER/OWNER):
+    //   - id: string (required, immutable, == customerId, 1..128 chars)
+    //   - room_id: string (required, immutable, 1..128 chars)
+    //   - name: string (required, 1..150 chars)
+    //   - phone: string (required, 1..256 chars)
+    //   - alt_phone: string | null (optional, max 256 chars)
+    //   - address: string | null (optional, max 500 chars)
+    //   - notes: string | null (optional, max 2000 chars)
+    //   - is_deleted: bool (optional/required bool, must be false on create)
+    //   - created_at: timestamp (required, immutable, == request.time on create)
+    //   - updated_at: timestamp (required, == request.time on create/update)
+    //
+    // Collection: bookings
+    // Document ID: {bookingId}
+    // Operational fields ONLY (server-written via atomic slot lock transactions).
+    // Money fields (total_amount, advance_amount, paid_amount, due_amount,
+    // hall_rent, base_price, extra_services_amount) are NEVER stored here:
+    //   - id, room_id, hall_id, customer_id, booking_number, event_type,
+    //     event_date, slot, start_time, end_time, guest_count, package_name,
+    //     extra_services, status, notes, is_deleted, created_at, updated_at
+    //
+    // Collection: booking_slot_locks
+    // Document ID: {lockId}
+    // Fields (active member read-only; server-written):
+    //   - id, room_id, hall_id, event_date, locked_slot, booking_id
+    //
+    // Collection: booking_financials
+    // Document ID: {bookingId}
+    // Fields (MANAGER and OWNER read-only; server-written):
+    //   - booking_id, room_id, base_price, hall_rent, extra_services_amount,
+    //     total_amount, advance_amount, paid_amount, due_amount, updated_at
+    //
+    // Collection: payments
+    // Document ID: {paymentId}
+    // Fields (MANAGER and OWNER read-only; append-only via server):
+    //   - id, room_id, booking_id, receipt_number, payment_type, amount,
+    //     payment_date, method, received_by_user_id, is_reversed, created_at
+    //
+    // Collection: expenses
+    // Document ID: {expenseId}
+    // Fields (MANAGER/OWNER read; create by MANAGER/OWNER or STAFF if room allows;
+    //         never updated or deleted from client):
+    //   - id: string (required, == expenseId, 1..128 chars)
+    //   - room_id: string (required, 1..128 chars)
+    //   - category: string (required, enum)
+    //   - entry_type: string (required, == 'EXPENSE' on client create)
+    //   - amount: number (required, > 0, <= 1000000000)
+    //   - expense_date: string (required, YYYY-MM-DD)
+    //   - note: string | null (optional, max 1000 chars)
+    //   - receipt_photo: string | null (optional, max 500 chars)
+    //   - recorded_by_user_id: string (required, == request.auth.uid)
+    //   - is_reversed: bool (required, == false on client create)
+    //   - created_at: timestamp (required, == request.time)
+    //
+    // Collection: audit_logs
+    // Document ID: {logId}
+    // Fields (strictly active OWNER read-only; append-only from server):
+    //   - id, room_id, user_id, action, details, created_at
+    //
+    // Collection: member_invites
+    // Document ID: {inviteId}
+    // Fields (strictly active OWNER read-only; server-only write):
+    //   - id, room_id, email, role, status, invited_by, created_at, expires_at
+    //
+    // Collection: member_devices
+    // Document ID: {deviceId}
+    // Fields (strictly active OWNER read-only; server-only write):
+    //   - id, room_id, user_id, device_id, status, created_at, updated_at
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions: Authentication & Multi-Tenant RBAC
+    // ===============================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSyncService() {
+      return isSignedIn() && request.auth.uid == 'fmJyutD7ezP5oBaLzxTqHbVmSfH2';
+    }
+
+    function isAuthenticated() {
+      return isSignedIn();
+    }
+
+    function isUserOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isActiveMember(roomId) {
+      return isSignedIn() &&
+             roomId is string &&
+             roomId.size() >= 1 &&
+             roomId.size() <= 128 &&
+             exists(/databases/$(database)/documents/memberships/$(roomId + '_' + request.auth.uid)) &&
+             get(/databases/$(database)/documents/memberships/$(roomId + '_' + request.auth.uid)).data.status == 'ACTIVE';
+    }
+
+    function getRole(roomId) {
+      return get(/databases/$(database)/documents/memberships/$(roomId + '_' + request.auth.uid)).data.role;
+    }
+
+    function isOwner(roomId) {
+      return isActiveMember(roomId) && getRole(roomId) == 'OWNER';
+    }
+
+    function isManagerOrOwner(roomId) {
+      return isActiveMember(roomId) && getRole(roomId) in ['OWNER', 'MANAGER'];
+    }
+
+    function isStaff(roomId) {
+      return isActiveMember(roomId) && getRole(roomId) == 'STAFF';
+    }
+
+    function isStaffOrAbove(roomId) {
+      return isActiveMember(roomId) && getRole(roomId) in ['OWNER', 'MANAGER', 'STAFF'];
+    }
+
+    function roomAllowsStaffCosts(roomId) {
+      return exists(/databases/$(database)/documents/rooms/$(roomId)) &&
+             get(/databases/$(database)/documents/rooms/$(roomId)).data.get('allow_staff_costs', false) == true &&
+             get(/databases/$(database)/documents/rooms/$(roomId)).data.get('is_deleted', false) != true;
+    }
+
+    // ===============================================================
+    // Helper Functions: Schema, Type & Bounds Validation
+    // ===============================================================
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isValidOptionalString(data, field, minLen, maxLen) {
+      return !(field in data) ||
+             data[field] == null ||
+             (data[field] is string && data[field].size() >= minLen && data[field].size() <= maxLen);
+    }
+
+    function isValidOptionalBool(data, field) {
+      return !(field in data) || data[field] is bool;
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+             email.size() >= 3 &&
+             email.size() <= 254 &&
+             email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidUrl(url, maxLen) {
+      return url is string &&
+             url.size() <= maxLen &&
+             (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    function isValidTimeHHMM(val) {
+      return val is string &&
+             val.size() == 5 &&
+             val.matches("^\\d{2}:\\d{2}$");
+    }
+
+    function isValidDateYMD(val) {
+      return val is string &&
+             val.size() == 10 &&
+             val.matches("^\\d{4}-\\d{2}-\\d{2}$");
+    }
+
+    function isNonNegativeNumber(val, maxVal) {
+      return val is number && val >= 0 && val <= maxVal;
+    }
+
+    function isPositiveNumber(val, maxVal) {
+      return val is number && val > 0 && val <= maxVal;
+    }
+
+    function isValidStringItem(listVal, idx, maxLen) {
+      return listVal.size() <= idx || (listVal[idx] is string && listVal[idx].size() <= maxLen);
+    }
+
+    function isValidStringList10(listVal, maxLen) {
+      return listVal is list &&
+             listVal.size() <= 10 &&
+             isValidStringItem(listVal, 0, maxLen) &&
+             isValidStringItem(listVal, 1, maxLen) &&
+             isValidStringItem(listVal, 2, maxLen) &&
+             isValidStringItem(listVal, 3, maxLen) &&
+             isValidStringItem(listVal, 4, maxLen) &&
+             isValidStringItem(listVal, 5, maxLen) &&
+             isValidStringItem(listVal, 6, maxLen) &&
+             isValidStringItem(listVal, 7, maxLen) &&
+             isValidStringItem(listVal, 8, maxLen) &&
+             isValidStringItem(listVal, 9, maxLen);
+    }
+
+    function isValidStringList20(listVal, maxLen) {
+      return listVal is list &&
+             listVal.size() <= 20 &&
+             isValidStringItem(listVal, 0, maxLen) &&
+             isValidStringItem(listVal, 1, maxLen) &&
+             isValidStringItem(listVal, 2, maxLen) &&
+             isValidStringItem(listVal, 3, maxLen) &&
+             isValidStringItem(listVal, 4, maxLen) &&
+             isValidStringItem(listVal, 5, maxLen) &&
+             isValidStringItem(listVal, 6, maxLen) &&
+             isValidStringItem(listVal, 7, maxLen) &&
+             isValidStringItem(listVal, 8, maxLen) &&
+             isValidStringItem(listVal, 9, maxLen) &&
+             isValidStringItem(listVal, 10, maxLen) &&
+             isValidStringItem(listVal, 11, maxLen) &&
+             isValidStringItem(listVal, 12, maxLen) &&
+             isValidStringItem(listVal, 13, maxLen) &&
+             isValidStringItem(listVal, 14, maxLen) &&
+             isValidStringItem(listVal, 15, maxLen) &&
+             isValidStringItem(listVal, 16, maxLen) &&
+             isValidStringItem(listVal, 17, maxLen) &&
+             isValidStringItem(listVal, 18, maxLen) &&
+             isValidStringItem(listVal, 19, maxLen);
+    }
+
+    // ===============================================================
+    // Domain Validators (Called in BOTH create and update)
+    // ===============================================================
+
+    function isValidUser(data, userId) {
+      return hasOnlyAllowedFields([
+               'id',
+               'email',
+               'name',
+               'picture',
+               'preferred_language',
+               'created_at',
+               'updated_at'
+             ]) &&
+             hasRequiredFields(['id', 'email', 'name', 'created_at', 'updated_at']) &&
+             data.id == userId &&
+             isValidString(data.id, 1, 128) &&
+             isValidEmail(data.email) &&
+             isValidString(data.name, 1, 100) &&
+             (!('picture' in data) || data.picture == null || data.picture == '' || isValidUrl(data.picture, 1000)) &&
+             (!('preferred_language' in data) || data.preferred_language in ['bn', 'en']) &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp &&
+             data.updated_at == request.time;
+    }
+
+    function isValidRoom(data, roomId) {
+      return hasOnlyAllowedFields([
+               'id',
+               'name',
+               'address',
+               'phone',
+               'email',
+               'logo',
+               'logo_scale',
+               'primary_color',
+               'default_language',
+               'join_approval_required',
+               'allow_staff_costs',
+               'day_start_time',
+               'day_end_time',
+               'night_start_time',
+               'night_end_time',
+               'buffer_enabled',
+               'buffer_minutes',
+               'created_by',
+               'created_at',
+               'updated_at',
+               'is_deleted'
+             ]) &&
+             hasRequiredFields([
+               'id',
+               'name',
+               'address',
+               'phone',
+               'created_by',
+               'created_at',
+               'updated_at'
+             ]) &&
+             data.id == roomId &&
+             isValidString(data.id, 1, 128) &&
+             isValidString(data.name, 1, 120) &&
+             isValidString(data.address, 1, 500) &&
+             isValidString(data.phone, 1, 30) &&
+             (!('email' in data) || data.email == null || data.email == '' || isValidEmail(data.email)) &&
+             (!('logo' in data) || data.logo == null || data.logo == '' ||
+               isValidUrl(data.logo, 2000) ||
+               (data.logo is string && data.logo.size() <= 2000 && data.logo.matches("^/[a-zA-Z0-9._/-]+$"))) &&
+             (!('logo_scale' in data) || data.logo_scale == null ||
+               (data.logo_scale is number && data.logo_scale >= 0.1 && data.logo_scale <= 5.0)) &&
+             isValidOptionalString(data, 'primary_color', 4, 20) &&
+             (!('default_language' in data) || data.default_language in ['bn', 'en']) &&
+             isValidOptionalBool(data, 'join_approval_required') &&
+             isValidOptionalBool(data, 'allow_staff_costs') &&
+             (!('day_start_time' in data) || isValidTimeHHMM(data.day_start_time)) &&
+             (!('day_end_time' in data) || isValidTimeHHMM(data.day_end_time)) &&
+             (!('night_start_time' in data) || isValidTimeHHMM(data.night_start_time)) &&
+             (!('night_end_time' in data) || isValidTimeHHMM(data.night_end_time)) &&
+             isValidOptionalBool(data, 'buffer_enabled') &&
+             (!('buffer_minutes' in data) ||
+               (data.buffer_minutes is int && data.buffer_minutes >= 0 && data.buffer_minutes <= 1440)) &&
+             isValidString(data.created_by, 1, 128) &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp &&
+             data.updated_at == request.time &&
+             isValidOptionalBool(data, 'is_deleted');
+    }
+
+    function isValidHall(data, hallId) {
+      return hasOnlyAllowedFields([
+               'id',
+               'room_id',
+               'name',
+               'capacity',
+               'day_price',
+               'night_price',
+               'full_price',
+               'photos',
+               'facilities',
+               'description',
+               'is_active',
+               'is_deleted',
+               'created_at',
+               'updated_at'
+             ]) &&
+             hasRequiredFields([
+               'id',
+               'room_id',
+               'name',
+               'capacity',
+               'day_price',
+               'night_price',
+               'full_price',
+               'is_active',
+               'created_at',
+               'updated_at'
+             ]) &&
+             data.id == hallId &&
+             isValidString(data.id, 1, 128) &&
+             isValidString(data.room_id, 1, 128) &&
+             isValidString(data.name, 1, 120) &&
+             data.capacity is int &&
+             data.capacity >= 1 &&
+             data.capacity <= 100000 &&
+             isNonNegativeNumber(data.day_price, 1000000000) &&
+             isNonNegativeNumber(data.night_price, 1000000000) &&
+             isNonNegativeNumber(data.full_price, 1000000000) &&
+             (!('photos' in data) || isValidStringList10(data.photos, 1000)) &&
+             (!('facilities' in data) || isValidStringList20(data.facilities, 100)) &&
+             isValidOptionalString(data, 'description', 0, 1000) &&
+             data.is_active is bool &&
+             isValidOptionalBool(data, 'is_deleted') &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp &&
+             data.updated_at == request.time;
+    }
+
+    function isValidCustomer(data, customerId) {
+      return hasOnlyAllowedFields([
+               'id',
+               'room_id',
+               'name',
+               'phone',
+               'alt_phone',
+               'address',
+               'notes',
+               'is_deleted',
+               'created_at',
+               'updated_at'
+             ]) &&
+             hasRequiredFields([
+               'id',
+               'room_id',
+               'name',
+               'phone',
+               'created_at',
+               'updated_at'
+             ]) &&
+             data.id == customerId &&
+             isValidString(data.id, 1, 128) &&
+             isValidString(data.room_id, 1, 128) &&
+             isValidString(data.name, 1, 150) &&
+             isValidString(data.phone, 1, 256) &&
+             isValidOptionalString(data, 'alt_phone', 0, 256) &&
+             isValidOptionalString(data, 'address', 0, 500) &&
+             isValidOptionalString(data, 'notes', 0, 2000) &&
+             isValidOptionalBool(data, 'is_deleted') &&
+             data.created_at is timestamp &&
+             data.updated_at is timestamp &&
+             data.updated_at == request.time;
+    }
+
+    function isValidExpense(data, expenseId) {
+      return hasOnlyAllowedFields([
+               'id',
+               'room_id',
+               'category',
+               'entry_type',
+               'amount',
+               'expense_date',
+               'note',
+               'receipt_photo',
+               'recorded_by_user_id',
+               'is_reversed',
+               'created_at'
+             ]) &&
+             hasRequiredFields([
+               'id',
+               'room_id',
+               'category',
+               'entry_type',
+               'amount',
+               'expense_date',
+               'recorded_by_user_id',
+               'is_reversed',
+               'created_at'
+             ]) &&
+             data.id == expenseId &&
+             isValidString(data.id, 1, 128) &&
+             isValidString(data.room_id, 1, 128) &&
+             data.category in [
+               'ELECTRICITY',
+               'SALARY',
+               'REPAIR',
+               'CLEANING',
+               'DECORATION_MATERIAL',
+               'FOOD',
+               'OTHER'
+             ] &&
+             data.entry_type == 'EXPENSE' &&
+             isPositiveNumber(data.amount, 1000000000) &&
+             isValidDateYMD(data.expense_date) &&
+             isValidOptionalString(data, 'note', 0, 1000) &&
+             isValidOptionalString(data, 'receipt_photo', 0, 500) &&
+             isValidString(data.recorded_by_user_id, 1, 128) &&
+             data.recorded_by_user_id == request.auth.uid &&
+             data.is_reversed is bool &&
+             data.is_reversed == false &&
+             data.created_at is timestamp &&
+             data.created_at == request.time;
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // Public read-only version config (single document 'version' only)
+    match /app_config/{docId} {
+      allow get: if docId == 'version';
+      allow list, write: if false;
+    }
+
+    // User profiles: strict PII isolation — user can only get/create/update own profile
+    match /users/{userId} {
+      allow get: if isUserOwner(userId);
+      allow list: if false;
+      allow create: if isUserOwner(userId) &&
+                       isValidUser(request.resource.data, userId) &&
+                       request.resource.data.created_at == request.time &&
+                       request.resource.data.updated_at == request.time;
+      allow update: if isUserOwner(userId) &&
+                       isValidUser(request.resource.data, userId) &&
+                       areImmutableFieldsUnchanged(['id', 'email', 'created_at']) &&
+                       request.resource.data.updated_at == request.time;
+      allow delete: if false;
+    }
+
+    // Rooms: active members can get non-deleted room by ID; list/create/delete forbidden on client;
+    // ONLY active OWNER can update non-deleted room settings/branding (never join_code).
+    match /rooms/{roomId} {
+      allow get: if isActiveMember(roomId) &&
+                    resource.data.get('is_deleted', false) != true;
+      allow list: if false;
+      allow create, delete: if false;
+      allow update: if isOwner(roomId) &&
+                       resource.data.get('is_deleted', false) != true &&
+                       isValidRoom(request.resource.data, roomId) &&
+                       areImmutableFieldsUnchanged(['id', 'created_by', 'created_at', 'is_deleted']) &&
+                       request.resource.data.updated_at == request.time;
+    }
+
+    // Room secrets (join_code): strictly active OWNER get-only; all other roles/rooms denied
+    match /room_secrets/{roomId} {
+      allow get: if isOwner(roomId);
+      allow list, write: if false;
+    }
+
+    // Memberships (${roomId}_${userId}): user can read own membership status;
+    // active OWNER/MANAGER can read room memberships; Staff/Viewer/non-members denied;
+    // all writes server-only.
+    match /memberships/{membershipId} {
+      allow get: if isSignedIn() &&
+                    resource != null &&
+                    (resource.data.user_id == request.auth.uid || isManagerOrOwner(resource.data.room_id));
+      allow list: if isSignedIn() &&
+                     (resource.data.user_id == request.auth.uid || isManagerOrOwner(resource.data.room_id));
+      allow create, update, delete: if false;
+    }
+
+    // Halls: active members can read non-deleted halls; MANAGER and OWNER can create/update; soft-delete only
+    match /halls/{hallId} {
+      allow get, list: if isActiveMember(resource.data.room_id) &&
+                          resource.data.get('is_deleted', false) != true;
+      allow create: if isManagerOrOwner(request.resource.data.room_id) &&
+                       isValidHall(request.resource.data, hallId) &&
+                       request.resource.data.get('is_deleted', false) == false &&
+                       request.resource.data.created_at == request.time &&
+                       request.resource.data.updated_at == request.time;
+      allow update: if isManagerOrOwner(resource.data.room_id) &&
+                       isValidHall(request.resource.data, hallId) &&
+                       areImmutableFieldsUnchanged(['id', 'room_id', 'created_at']) &&
+                       request.resource.data.updated_at == request.time;
+      allow delete: if false;
+    }
+
+    // Customers: active members can read non-deleted customers; STAFF+ can create/update;
+    // only MANAGER and OWNER can change is_deleted (soft-delete); hard delete denied.
+    match /customers/{customerId} {
+      allow get, list: if isActiveMember(resource.data.room_id) &&
+                          resource.data.get('is_deleted', false) != true;
+      allow create: if isStaffOrAbove(request.resource.data.room_id) &&
+                       isValidCustomer(request.resource.data, customerId) &&
+                       request.resource.data.get('is_deleted', false) == false &&
+                       request.resource.data.created_at == request.time &&
+                       request.resource.data.updated_at == request.time;
+      allow update: if isStaffOrAbove(resource.data.room_id) &&
+                       (resource.data.get('is_deleted', false) != true || isManagerOrOwner(resource.data.room_id)) &&
+                       isValidCustomer(request.resource.data, customerId) &&
+                       areImmutableFieldsUnchanged(['id', 'room_id', 'created_at']) &&
+                       request.resource.data.updated_at == request.time &&
+                       (request.resource.data.get('is_deleted', false) == resource.data.get('is_deleted', false) ||
+                        isManagerOrOwner(resource.data.room_id));
+      allow delete: if false;
+    }
+
+    // Bookings (operational fields only): active members can read non-deleted bookings;
+    // all writes go through trusted server transactions with atomic slot locking.
+    match /bookings/{bookingId} {
+      allow get, list: if isActiveMember(resource.data.room_id) &&
+                          resource.data.get('is_deleted', false) != true;
+      allow create, update, delete: if false;
+    }
+
+    // Booking slot locks: active members can read slot locks; all writes server-only
+    match /booking_slot_locks/{lockId} {
+      allow get, list: if isActiveMember(resource.data.room_id);
+      allow write: if false;
+    }
+
+    // Booking financials: strictly MANAGER and OWNER read-only; Staff and Viewer denied
+    match /booking_financials/{bookingId} {
+      allow get, list: if isManagerOrOwner(resource.data.room_id);
+      allow write: if false;
+    }
+
+    // Payments: strictly MANAGER and OWNER read-only; append-only via trusted server code
+    match /payments/{paymentId} {
+      allow get, list: if isManagerOrOwner(resource.data.room_id);
+      allow write: if false;
+    }
+
+    // Expenses (Costs): MANAGER and OWNER can read; MANAGER/OWNER can create, and STAFF can
+    // create ONLY when room.allow_staff_costs == true; never edited or deleted from client.
+    match /expenses/{expenseId} {
+      allow get, list: if isManagerOrOwner(resource.data.room_id);
+      allow create: if (
+                         isManagerOrOwner(request.resource.data.room_id) ||
+                         (isStaff(request.resource.data.room_id) &&
+                          roomAllowsStaffCosts(request.resource.data.room_id))
+                       ) &&
+                       isValidExpense(request.resource.data, expenseId);
+      allow update, delete: if false;
+    }
+
+    // Audit logs: strictly active OWNER read-only; Manager, Staff, Viewer denied; server append-only
+    match /audit_logs/{logId} {
+      allow get, list: if isOwner(resource.data.room_id);
+      allow write: if false;
+    }
+
+    // Member invites: strictly active OWNER read-only; server/sync-service write only
+    match /member_invites/{inviteId} {
+      allow read, write: if isSyncService();
+      allow read: if isOwner(resource.data.room_id);
+      allow write: if false;
+    }
+
+    // Member devices: strictly active OWNER read-only; server/sync-service write only
+    match /member_devices/{deviceId} {
+      allow read, write: if isSyncService();
+      allow read: if isOwner(resource.data.room_id);
+      allow write: if false;
+    }
+
+    // Default deny all other paths and subcollections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

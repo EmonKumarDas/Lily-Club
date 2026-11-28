@@ -1,0 +1,61 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function membershipDoc(roomId) {
+      return /databases/(default)/documents/memberships/$(roomId + '_' + request.auth.uid);
+    }
+
+    function isActiveMember(roomId) {
+      return isSignedIn() &&
+             roomId is string &&
+             roomId.size() >= 1 &&
+             roomId.size() <= 128 &&
+             firestore.exists(membershipDoc(roomId)) &&
+             firestore.get(membershipDoc(roomId)).data.status == 'ACTIVE' &&
+             firestore.exists(/databases/(default)/documents/rooms/$(roomId)) &&
+             firestore.get(/databases/(default)/documents/rooms/$(roomId)).data.get('is_deleted', false) != true;
+    }
+
+    function getRole(roomId) {
+      return firestore.get(membershipDoc(roomId)).data.role;
+    }
+
+    function isManagerOrOwner(roomId) {
+      return isActiveMember(roomId) && getRole(roomId) in ['OWNER', 'MANAGER'];
+    }
+
+    function isStaffAllowedCostUpload(roomId) {
+      return isActiveMember(roomId) &&
+             getRole(roomId) == 'STAFF' &&
+             firestore.get(/databases/(default)/documents/rooms/$(roomId)).data.get('allow_staff_costs', false) == true;
+    }
+
+    function isValidReceiptOrLogoImage() {
+      return request.resource != null &&
+             request.resource.size > 0 &&
+             request.resource.size <= 2 * 1024 * 1024 &&
+             request.resource.contentType.matches('^image/(png|jpeg|webp)$');
+    }
+
+    // Per-room image uploads (receipts, club logos): images only, max 2MB, random non-executable filename, no overwrite/delete
+    match /rooms/{roomId}/uploads/{fileName} {
+      allow get: if isActiveMember(roomId);
+      allow list: if false;
+      allow create: if (isManagerOrOwner(roomId) || isStaffAllowedCostUpload(roomId)) &&
+                       resource == null &&
+                       isValidReceiptOrLogoImage() &&
+                       fileName.matches('^[a-zA-Z0-9_-]{12,128}\\.(png|jpg|jpeg|webp)$');
+      allow update, delete: if false;
+    }
+
+    // Strict deny-by-default everywhere else
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

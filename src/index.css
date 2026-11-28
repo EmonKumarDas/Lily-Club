@@ -2,12 +2,28 @@
 
 @layer base {
   :root {
-    --font-sans: 'Hind Siliguri', 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    line-height: 1.6;
+    --font-sans: 'Hind Siliguri', 'Noto Sans Bengali', 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --lily-primary: #4A2545;
+    --lily-primary-hover: #5D2F57;
+    --lily-green: #0E8A44;
+    --lily-gold: #C5A059;
+    --lily-bg: #FDFBF9;
+    --lily-blush: #FAF4F0;
+    --lily-surface: #FFFFFF;
+    line-height: 1.65;
+  }
+
+  html.dark {
+    --lily-bg: #141115;
+    --lily-blush: #1D1820;
+    --lily-surface: #1D1820;
   }
 
   body {
     font-family: var(--font-sans);
+    background-color: var(--lily-bg);
+    color: #1c1917;
+    line-height: 1.65;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
@@ -18,57 +34,62 @@
     overscroll-behavior-y: none;
   }
 
-  /* Prevent iOS/Android zoom-on-focus and give comfortable touch targets */
+  html.dark body {
+    background-color: #141115 !important;
+    color: #f5f5f4;
+  }
+
+  /* Accessible visible focus rings for keyboard navigation */
+  :focus-visible {
+    outline: 2px solid #C5A059;
+    outline-offset: 2px;
+  }
+
+  /* Prevent iOS/Android zoom-on-focus and guarantee >= 44px touch targets */
   @media (max-width: 767px) {
     input, select, textarea { font-size: 16px !important; }
-    button, select, input:not([type="checkbox"]):not([type="radio"]) { min-height: 40px; }
+    button, select, input:not([type="checkbox"]):not([type="radio"]) { min-height: 44px; }
     img, svg, video, canvas { max-width: 100%; }
     table { font-size: 12px; }
   }
 
   /* Bottom nav & floating button respect the phone's gesture bar */
   nav[aria-label="Mobile Navigation"] { padding-bottom: calc(0.25rem + env(safe-area-inset-bottom)); }
-
-  /* Pure Dark (#000000 AMOLED True Black) Mode for Web */
-  html.dark body {
-    background-color: #000000 !important;
-    color: #ffffff;
-  }
 }
 
-/* Custom soft lily theme colors */
+/* Custom soft lily theme utility classes */
 .bg-lily-primary {
-  background-color: #582C4D;
+  background-color: var(--lily-primary);
 }
 .bg-lily-primary-hover {
-  background-color: #6C375F;
+  background-color: var(--lily-primary-hover);
 }
 .text-lily-primary {
-  color: #582C4D;
+  color: var(--lily-primary);
 }
 .border-lily-primary {
-  border-color: #582C4D;
+  border-color: var(--lily-primary);
 }
 
 .bg-lily-gold {
-  background-color: #C5A059;
+  background-color: var(--lily-gold);
 }
 .text-lily-gold {
-  color: #C5A059;
+  color: var(--lily-gold);
 }
 
 .bg-lily-blush {
-  background-color: #F8F3F1;
+  background-color: var(--lily-blush);
 }
 
-/* Prevent clipping of Bengali diacritics */
+/* Prevent clipping of Bengali vowel diacritics (কার / রেফ / চন্দ্রবিন্দু) */
 .bengali-text {
-  line-height: 1.65 !important;
+  line-height: 1.68 !important;
   padding-top: 1px;
   padding-bottom: 2px;
 }
 
-/* Custom scrollbars */
+/* Clean custom scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -79,10 +100,10 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(150, 150, 150, 0.3);
+  background: rgba(140, 120, 138, 0.32);
   border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(150, 150, 150, 0.5);
+  background: rgba(140, 120, 138, 0.52);
 }

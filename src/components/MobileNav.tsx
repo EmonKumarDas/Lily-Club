@@ -82,9 +82,11 @@ export const MobileNav: React.FC<MobileNavProps> = ({
                 <p className="text-xs font-bold text-stone-900 dark:text-stone-100">
                   {activeRoom.name}
                 </p>
-                <p className="text-[11px] font-mono text-stone-500 dark:text-stone-400">
-                  ID: {activeRoom.join_code}
-                </p>
+                {role && (
+                  <p className="text-[11px] font-semibold text-stone-500 dark:text-stone-400">
+                    {t(`role_${role}` as any)}
+                  </p>
+                )}
               </div>
               <button
                 onClick={() => setMoreOpen(false)}
